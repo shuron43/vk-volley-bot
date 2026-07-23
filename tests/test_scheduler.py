@@ -88,6 +88,40 @@ def test_next_target_returns_upcoming_configured_time(
     assert target == expected
 
 
+@pytest.mark.parametrize(
+    ("collect_target", "remind_target", "expected_target", "expected_event"),
+    [
+        (
+            datetime.datetime(2024, 1, 2, 10, 0, tzinfo=datetime.UTC),
+            datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC),
+            datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC),
+            "remind",
+        ),
+        (
+            datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC),
+            datetime.datetime(2024, 1, 2, 8, 0, tzinfo=datetime.UTC),
+            datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC),
+            "collect",
+        ),
+        (
+            datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC),
+            None,
+            datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC),
+            "collect",
+        ),
+    ],
+)
+def test_pick_next_event_selects_nearer_target(
+    collect_target: datetime.datetime,
+    remind_target: datetime.datetime | None,
+    expected_target: datetime.datetime,
+    expected_event: str,
+) -> None:
+    target, event = scheduler._pick_next_event(collect_target, remind_target)
+    assert target == expected_target
+    assert event == expected_event
+
+
 @pytest.mark.anyio
 async def test_send_announcement_sends_configured_message(config: Config) -> None:
     # Given: an API whose message endpoint succeeds
@@ -102,6 +136,31 @@ async def test_send_announcement_sends_configured_message(config: Config) -> Non
     assert sent["peer_id"] == config.chat_peer_id
     assert sent["keyboard"] == "keyboard"
     assert sent["message"].startswith("🏐 Сбор на волейбол!")
+
+
+@pytest.mark.anyio
+async def test_send_reminder_shows_current_list(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    # Given: a storage with two entries and a mocked API
+    storage = Storage(tmp_path / "participants.json")
+    await storage.add_user(vk_id=1, name="Alice")
+    await storage.add_friend(name="Bob")
+
+    api = MagicMock()
+    api.messages.send = AsyncMock(return_value=1)
+
+    # When: the scheduler sends a reminder
+    await scheduler._send_reminder(api, config, "keyboard", storage)
+
+    # Then: the message contains the formatted participant list
+    sent = api.messages.send.await_args.kwargs
+    assert sent["peer_id"] == config.chat_peer_id
+    assert sent["keyboard"] == "keyboard"
+    assert "Напоминаем: сбор на волейбол!" in sent["message"]
+    assert "1. Alice" in sent["message"]
+    assert "2. Bob (друг)" in sent["message"]
 
 
 @pytest.mark.anyio
@@ -136,4 +195,4 @@ async def test_scheduler_retries_announcement_after_failure(
     # Then: it logs the failure, waits five minutes, and retries the delivery
     assert api.messages.send.await_count == 2
     assert sleep_durations == [3600.0, 300.0, 3600.0]
-    assert "Scheduled announcement failed; retrying in five minutes" in caplog.text
+    assert "Weekly announcement failed; retrying in five minutes" in caplog.text

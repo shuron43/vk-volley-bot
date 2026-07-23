@@ -85,3 +85,78 @@ def test_config_rejects_data_path_with_traversal(
 
     with pytest.raises(ValidationError, match="data_path"):
         Config()
+
+
+@pytest.mark.parametrize("remind_time", ["08:00", "00:00", "23:59"])
+def test_config_accepts_valid_remind_time(
+    monkeypatch: pytest.MonkeyPatch,
+    remind_time: str,
+) -> None:
+    """Config accepts valid HH:MM values for remind_time."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("REMIND_TIME", remind_time)
+
+    config = Config()
+    assert config.remind_time == remind_time
+
+
+@pytest.mark.parametrize(
+    "remind_time",
+    ["24:00", "99:99", "7:30", "10:0", "10", "abc", "10:70"],
+)
+def test_config_rejects_invalid_remind_time(
+    monkeypatch: pytest.MonkeyPatch,
+    remind_time: str,
+) -> None:
+    """Config rejects malformed or out-of-range remind times."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("REMIND_TIME", remind_time)
+
+    with pytest.raises(ValidationError, match="remind_time"):
+        Config()
+
+
+@pytest.mark.parametrize("remind_weekday", [0, 3, 6])
+def test_config_accepts_valid_remind_weekday(
+    monkeypatch: pytest.MonkeyPatch,
+    remind_weekday: int,
+) -> None:
+    """Config accepts valid weekday values for remind_weekday."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("REMIND_WEEKDAY", str(remind_weekday))
+
+    config = Config()
+    assert config.remind_weekday == remind_weekday
+
+
+@pytest.mark.parametrize("remind_weekday", [-1, 7, 10])
+def test_config_rejects_invalid_remind_weekday(
+    monkeypatch: pytest.MonkeyPatch,
+    remind_weekday: int,
+) -> None:
+    """Config rejects out-of-range remind_weekday values."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("REMIND_WEEKDAY", str(remind_weekday))
+
+    with pytest.raises(ValidationError, match="remind_weekday"):
+        Config()
+
+
+def test_config_remind_time_properties(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Given a valid remind_time, hour and minute properties parse correctly."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("REMIND_TIME", "07:45")
+    config = Config()
+    assert config.remind_hour == 7
+    assert config.remind_minute == 45
+
+
+def test_config_remind_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reminder settings have sensible defaults when not overridden."""
+    _set_base_env(monkeypatch)
+    config = Config()
+    assert config.remind_enabled is True
+    assert config.remind_weekday == 0
+    assert config.remind_time == "08:00"
+    assert config.remind_hour == 8
+    assert config.remind_minute == 0

@@ -1,56 +1,17 @@
 """VK bot message handlers."""
 
 import logging
-from typing import Final, assert_never
+from typing import Final
 
 from vkbottle import GroupEventType, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
 from vkbottle.dispatch.rules.base import PayloadRule, RegexRule
 
+from src.formatting import format_entries, help_text
 from src.keyboard import build_inline_keyboard
-from src.storage import Entry, FriendEntry, Storage, UserEntry
+from src.storage import Storage
 
 _LOGGER: Final = logging.getLogger(__name__)
-
-
-def format_entries(entries: list[Entry]) -> str:
-    """Format the participant list for a bot response."""
-    if not entries:
-        return "Пока никто не записался."
-
-    lines: list[str] = []
-    for index, entry in enumerate(entries, 1):
-        match entry:
-            case UserEntry():
-                lines.append(f"{index}. {entry.name}")
-            case FriendEntry():
-                lines.append(f"{index}. {entry.name} (друг)")
-            case unreachable:  # type: ignore[reportUnnecessaryComparison]
-                assert_never(unreachable)
-    return "Список участников:\n" + "\n".join(lines)
-
-
-def help_text(*, compact: bool = False) -> str:
-    """Return the message-command help text."""
-    if compact:
-        return (
-            "Команды:\n"
-            "➕ — записаться\n"
-            "➖ — отписаться\n"
-            "+ Имя — записать друга\n"
-            "- Имя — убрать друга\n"
-            "📋 — список\n"
-            "❓ — помощь"
-        )
-    return (
-        "Команды:\n"
-        "➕ или записаться — записаться\n"
-        "➖ или отписаться — отписаться\n"
-        "+ Имя — записать друга\n"
-        "- Имя — убрать друга\n"
-        "📋 список — кто идёт\n"
-        "❓ ? — помощь"
-    )
 
 
 def extract_friend_name(text: str) -> str:

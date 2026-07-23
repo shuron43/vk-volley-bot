@@ -25,12 +25,15 @@ class Config(BaseSettings):
 | `chat_peer_id` | `int` | — | обязательное | `peer_id` группового чата |
 | `collect_weekday` | `int` | `2` | `0 <= v <= 6` | День недели сбора (0=Пн, 6=Вс) |
 | `collect_time` | `str` | `"10:00"` | формат `HH:MM`, часы 0–23, минуты 0–59 | Время анонса нового сбора |
+| `remind_enabled` | `bool` | `true` | — | Включить напоминание перед сбором |
+| `remind_weekday` | `int` | `0` | `0 <= v <= 6` | День недели напоминания |
+| `remind_time` | `str` | `"08:00"` | формат `HH:MM` | Время напоминания |
 | `data_path` | `str` | `"data.json"` | — | Путь к JSON-файлу хранилища |
 
 ### Валидаторы
 
 ```python
-@field_validator("collect_weekday")
+@field_validator("collect_weekday", "remind_weekday")
 @classmethod
 def _validate_weekday(cls, v: int) -> int
 ```
@@ -38,9 +41,9 @@ def _validate_weekday(cls, v: int) -> int
 Выбрасывает `ValueError` если день недели вне диапазона `0–6`.
 
 ```python
-@field_validator("collect_time")
+@field_validator("collect_time", "remind_time")
 @classmethod
-def _validate_collect_time(cls, v: str) -> str
+def _validate_time(cls, v: str) -> str
 ```
 
 Выбрасывает `ValueError` если время не в формате `HH:MM`, часы вне `0–23` или минуты вне `0–59`.
@@ -124,13 +127,9 @@ JSON-хранилище участников. Безопасен в рамках
 
 ---
 
-## `src/bot.py`
+## `src/formatting.py`
 
-Хендлеры сообщений vkbottle. Все хендлеры асинхронные (`async def`).
-
-### `build_inline_keyboard() -> str`
-
-Собирает inline-клавиатуру с кнопками `+`, `-`, `Список`, `Помощь` и возвращает её JSON.
+Хелперы форматирования ответов бота.
 
 ### `format_entries(entries: list[Entry]) -> str`
 
@@ -139,6 +138,14 @@ JSON-хранилище участников. Безопасен в рамках
 ### `help_text() -> str`
 
 Возвращает статический текст справки по командам.
+
+## `src/bot.py`
+
+Хендлеры сообщений vkbottle. Все хендлеры асинхронные (`async def`).
+
+### `build_inline_keyboard() -> str`
+
+Собирает inline-клавиатуру с кнопками `+`, `-`, `Список`, `Помощь` и возвращает её JSON.
 
 ### `extract_friend_name(text: str) -> str`
 
@@ -252,7 +259,7 @@ JSON-хранилище участников. Безопасен в рамках
 
 ## `src/scheduler.py`
 
-Еженедельный планировщик сброса списка и анонса.
+Еженедельный планировщик сброса списка, анонса и напоминания.
 
 ### `_next_target(now: datetime.datetime, weekday: int, hour: int, minute: int) -> datetime.datetime`
 
@@ -262,24 +269,41 @@ JSON-хранилище участников. Безопасен в рамках
 
 Отправляет еженедельный анонс через `api.messages.send(...)` с inline-клавиатурой.
 
+### `async _send_reminder(api: API, config: Config, inline_keyboard: str, storage: Storage) -> None`
+
+Отправляет напоминание с текущим списком участников. **Не очищает** хранилище.
+
+### `def _pick_next_event(collect_target: datetime.datetime, remind_target: datetime.datetime | None) -> tuple[datetime.datetime, str]`
+
+Выбирает ближайшее событие из двух target'ов. Возвращает `(target, event_label)`, где `event_label` — `"collect"` или `"remind"`.
+
+### `async _run_with_retry(label: str, operation: Callable[[], Awaitable[None]]) -> None`
+
+Выполняет операцию с ретрай-логикой: при сбое `OSError`, `TimeoutError` или `VKAPIError` ждёт 5 минут и повторяет.
+
 ### `run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn`
 
-Бесконечный цикл:
+Бесконечный цикл с двумя событиями:
 
-1. **Вычисление следующей цели:**
+1. **Вычисление следующих целей:**
    - Берёт `now = datetime.datetime.now()` (локальное время сервера)
-   - Вызывает `_next_target(now, weekday, hour, minute)`
+   - Вычисляет `collect_target` — время следующего сбора
+   - Если `remind_enabled=True`, вычисляет `remind_target` — время напоминания
+   - Если напоминание и сбор совпадают — напоминание сдвигается на неделю (приоритет у сбора)
 
-2. **Ожидание:**
+2. **Выбор ближайшего события:**
+   - Вызывает `_pick_next_event(collect_target, remind_target)`
+
+3. **Ожидание:**
    - `sleep_seconds = (target - now).total_seconds()`
    - `await anyio.sleep(sleep_seconds)`
 
-3. **Действие:**
-   - `await storage.clear()` — сбрасывает участников
-   - Вызывает `await _send_announcement(api, config, inline_keyboard)`
+4. **Действие:**
+   - **Сбор** (`event == "collect"`): `await storage.clear()` → отправляет анонс
+   - **Напоминание** (`event == "remind"`): отправляет текущий список участников
 
-4. **Обработка ошибок:**
-   - При сбое `OSError`, `TimeoutError` или `VKAPIError` — логирует ошибку, ждёт 5 минут и повторяет шаг 3
+5. **Обработка ошибок:**
+   - При сбое `OSError`, `TimeoutError` или `VKAPIError` — логирует ошибку, ждёт 5 минут и повторяет шаг 4
    - При успехе — переходит к шагу 1
 
 **Тип возвращаемого значения:** `NoReturn` — функция никогда не завершается нормально.

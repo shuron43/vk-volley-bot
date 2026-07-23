@@ -51,13 +51,15 @@
    - Текстовые команды → `msg.answer(..., keyboard=inline_keyboard)`
    - Callback-кнопки → `event.show_snackbar(...)` или `event.send_message(...)`
 
-### 2. Поток планировщика (еженедельный анонс)
+### 2. Поток планировщика (еженедельный анонс + напоминание)
 
-1. `scheduler.py` вычисляет время до следующего запланированного дня
-2. Засыпает на вычисленный интервал (`anyio.sleep`)
+1. `scheduler.py` вычисляет два ближайших события:
+   - **Сбор** — день/время из `COLLECT_WEEKDAY`/`COLLECT_TIME`
+   - **Напоминание** — день/время из `REMIND_WEEKDAY`/`REMIND_TIME` (если включено)
+2. Выбирает ближайшее событие и засыпает на вычисленный интервал (`anyio.sleep`)
 3. По пробуждению:
-   - Очищает хранилище участников (`storage.clear()`)
-   - Отправляет анонс нового сбора в чат
+   - Если наступил **сбор**: очищает хранилище (`storage.clear()`) и отправляет анонс нового сбора
+   - Если наступило **напоминание**: отправляет текущий список участников без очистки
 4. Цикл повторяется бесконечно
 
 ## Конкурентность
@@ -137,5 +139,5 @@ main.py
 - `Config` — `tests/test_config.py`: валидация `collect_weekday` и `collect_time`
 - `Storage` — `tests/test_storage.py`: операции add/remove/clear на временном файле (`tmp_path`)
 - `bot.py` — `tests/test_bot.py`: хендлеры с мокированием VK API и `Storage`
-- `scheduler.py` — `tests/test_scheduler.py`: чистая логика `_next_target` без sleep
+- `scheduler.py` — `tests/test_scheduler.py`: чистая логика `_next_target` без sleep, dual-event loop (collect + remind)
 - `test_smoke.py` — интеграционный импорт всех модулей

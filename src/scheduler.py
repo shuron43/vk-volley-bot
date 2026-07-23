@@ -3,6 +3,7 @@
 import datetime
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from typing import Final, NoReturn
 
 import anyio
@@ -10,6 +11,7 @@ from vkbottle import VKAPIError
 from vkbottle.api import API
 
 from src.config import Config
+from src.formatting import format_entries
 from src.keyboard import build_inline_keyboard
 from src.storage import Storage
 
@@ -45,6 +47,54 @@ async def _send_announcement(
     )
 
 
+async def _send_reminder(
+    api: API, config: Config, inline_keyboard: str, storage: Storage
+) -> None:
+    """Send the weekly reminder with current participant list."""
+    entries = await storage.list_entries()
+    body = format_entries(entries)
+    message = f"🏐 Напоминаем: сбор на волейбол!\n\n{body}"
+    _ = await api.messages.send(
+        peer_id=config.chat_peer_id,
+        message=message,
+        keyboard=inline_keyboard,
+        random_id=secrets.randbelow(2_147_483_647),
+    )
+
+
+def _pick_next_event(
+    collect_target: datetime.datetime,
+    remind_target: datetime.datetime | None,
+) -> tuple[datetime.datetime, str]:
+    """Return the nearer target and its label ('collect' or 'remind')."""
+    if remind_target is None:
+        return collect_target, "collect"
+    if collect_target <= remind_target:
+        return collect_target, "collect"
+    return remind_target, "remind"
+
+
+async def _run_with_retry(
+    label: str,
+    operation: Callable[[], Awaitable[None]],
+) -> None:
+    """Run an operation with the scheduler's standard retry loop."""
+    while True:
+        try:
+            await operation()
+            _LOGGER.info("%s sent successfully", label)
+        except anyio.get_cancelled_exc_class():
+            raise
+        except (OSError, TimeoutError, VKAPIError):
+            _LOGGER.exception(
+                "%s failed; retrying in five minutes",
+                label,
+            )
+            await anyio.sleep(_RETRY_DELAY_SECONDS)
+        else:
+            break
+
+
 async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
     """Loop forever, waiting for the configured weekday/time."""
     weekday = config.collect_weekday
@@ -55,26 +105,56 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
 
     while True:
         now = datetime.datetime.now()  # noqa: DTZ005
-        target = _next_target(now, weekday, hour, minute)
+        collect_target = _next_target(now, weekday, hour, minute)
+
+        if config.remind_enabled:
+            remind_target = _next_target(
+                now,
+                config.remind_weekday,
+                config.remind_hour,
+                config.remind_minute,
+            )
+            # If reminder falls on the same instant as collection, push it
+            # to the next week so collection always takes priority.
+            if remind_target == collect_target:
+                remind_target += datetime.timedelta(days=7)
+        else:
+            remind_target = None
+
+        target, event = _pick_next_event(collect_target, remind_target)
         sleep_seconds = (target - now).total_seconds()
         _LOGGER.info(
-            "Next announcement at %s (sleep %.0f seconds)",
+            "Next event '%s' at %s (sleep %.0f seconds)",
+            event,
             target.isoformat(),
             sleep_seconds,
         )
         await anyio.sleep(sleep_seconds)
 
-        while True:
-            try:
-                await storage.clear()
-                await _send_announcement(api, config, inline_keyboard)
-                _LOGGER.info("Weekly announcement sent to peer %s", config.chat_peer_id)
-            except anyio.get_cancelled_exc_class():
-                raise
-            except (OSError, TimeoutError, VKAPIError):
-                _LOGGER.exception(
-                    "Scheduled announcement failed; retrying in five minutes"
-                )
-                await anyio.sleep(_RETRY_DELAY_SECONDS)
-            else:
-                break
+        if event == "collect":
+            await _run_with_retry(
+                "Weekly announcement",
+                _announcement_op(api, config, inline_keyboard, storage),
+            )
+        else:
+            await _run_with_retry(
+                "Weekly reminder",
+                _reminder_op(api, config, inline_keyboard, storage),
+            )
+
+
+def _announcement_op(
+    api: API, config: Config, inline_keyboard: str, storage: Storage
+) -> Callable[[], Awaitable[None]]:
+    async def _op() -> None:
+        await storage.clear()
+        await _send_announcement(api, config, inline_keyboard)
+    return _op
+
+
+def _reminder_op(
+    api: API, config: Config, inline_keyboard: str, storage: Storage
+) -> Callable[[], Awaitable[None]]:
+    async def _op() -> None:
+        await _send_reminder(api, config, inline_keyboard, storage)
+    return _op

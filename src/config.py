@@ -38,6 +38,18 @@ class Config(BaseSettings):
         default="10:00",
         description="Local time to announce collection HH:MM",
     )
+    remind_enabled: bool = Field(
+        default=True,
+        description="Send a reminder message on a fixed weekday before collection",
+    )
+    remind_weekday: int = Field(
+        default=0,
+        description="Weekday for reminder (0=Monday, 6=Sunday)",
+    )
+    remind_time: str = Field(
+        default="08:00",
+        description="Local time for reminder HH:MM",
+    )
     data_path: str = Field(
         default="data.json",
         description="Path to JSON storage file",
@@ -58,6 +70,16 @@ class Config(BaseSettings):
         """Minute component of ``collect_time`` (0-59)."""
         return int(self.collect_time.split(":")[1])
 
+    @property
+    def remind_hour(self) -> int:
+        """Hour component of ``remind_time`` (0-23)."""
+        return int(self.remind_time.split(":")[0])
+
+    @property
+    def remind_minute(self) -> int:
+        """Minute component of ``remind_time`` (0-59)."""
+        return int(self.remind_time.split(":")[1])
+
     @field_validator("data_path")
     @classmethod
     def _validate_data_path(cls, v: str) -> str:
@@ -65,16 +87,16 @@ class Config(BaseSettings):
             raise ValueError(_DATA_PATH_ERROR_MSG)
         return v
 
-    @field_validator("collect_weekday")
+    @field_validator("collect_weekday", "remind_weekday")
     @classmethod
     def _validate_weekday(cls, v: int) -> int:
         if not 0 <= v <= _MAX_WEEKDAY:
             raise ValueError(_WEEKDAY_ERROR_MSG)
         return v
 
-    @field_validator("collect_time")
+    @field_validator("collect_time", "remind_time")
     @classmethod
-    def _validate_collect_time(cls, v: str) -> str:
+    def _validate_time(cls, v: str) -> str:
         if v.count(":") != 1:
             raise ValueError(_COLLECT_TIME_ERROR_MSG)
 
