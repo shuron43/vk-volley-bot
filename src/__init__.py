@@ -1,0 +1,1 @@
+"""VK volleyball bot package."""

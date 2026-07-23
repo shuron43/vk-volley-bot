@@ -1,0 +1,100 @@
+[project]
+name = "vk-volleyball-bot"
+version = "0.1.0"
+description = "VK bot for volleyball group chat sign-ups"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "vkbottle>=4.3",
+    "anyio>=4.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.21",
+    "ruff>=0.8",
+    "pytest>=8",
+    "pytest-cov>=5",
+    "pip-audit>=2.7",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.12"
+pythonPlatform = "All"
+include = ["src"]
+exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
+reportUnusedCallResult = "warning"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportUnusedVariable = "error"
+reportMissingParameterType = "error"
+# reportUnusedFunction/reportCallIssue оставлены в warning, потому что
+# vkbottle-обработчики (nested в setup_handlers) считаются unused,
+# а pydantic-settings (Config()) вызывается без явных аргументов.
+reportUnusedFunction = "warning"
+reportCallIssue = "warning"
+reportUnnecessaryComparison = "warning"
+reportPrivateUsage = "error"
+reportMissingTypeStubs = "warning"
+reportUnknownMemberType = "warning"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "ISC001",
+    "D203",
+    "D213",
+    "CPY001",
+    "FBT001",
+    "FBT002",
+    "TD002",
+    "TD003",
+    "FIX002",
+    "RUF001",
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",
+    "ARG",
+    "PLR2004",
+    "SLF001",
+    "D",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-config",
+    "--strict-markers",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]

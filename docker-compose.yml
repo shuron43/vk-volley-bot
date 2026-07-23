@@ -1,0 +1,27 @@
+services:
+  vk-bot:
+    build: .
+    container_name: vk-volleyball-bot
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: '0.5'
+    env_file:
+      - .env
+    environment:
+      DATA_PATH: /app/data/participants.json
+    volumes:
+      - vk-bot-data:/app/data
+    healthcheck:
+      test: ["CMD", "test", "-w", "/app/data"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  vk-bot-data:
