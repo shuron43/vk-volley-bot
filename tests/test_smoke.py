@@ -52,6 +52,6 @@ async def test_main_starts_bot_and_scheduler(monkeypatch: pytest.MonkeyPatch) ->
     config_factory.assert_called_once_with()
     storage_factory.assert_called_once_with(Path(config.data_path))
     bot_factory.assert_called_once_with(config.vk_token)
-    setup_handlers.assert_called_once_with(bot, storage)
+    setup_handlers.assert_called_once_with(bot, storage, config)
     run_scheduler.assert_awaited_once_with(api, config, storage)
     bot.run_polling.assert_awaited_once_with()

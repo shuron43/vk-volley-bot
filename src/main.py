@@ -21,7 +21,7 @@ async def main() -> None:
     _LOGGER.info("Storage initialized at %s", config.data_path)
     bot = Bot(config.vk_token)
 
-    setup_handlers(bot, storage)
+    setup_handlers(bot, storage, config)
     _LOGGER.info("Bot handlers registered")
 
     async with anyio.create_task_group() as tg:

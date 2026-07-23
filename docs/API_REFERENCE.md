@@ -28,7 +28,22 @@ class Config(BaseSettings):
 | `remind_enabled` | `bool` | `true` | — | Включить напоминание перед сбором |
 | `remind_weekday` | `int` | `0` | `0 <= v <= 6` | День недели напоминания |
 | `remind_time` | `str` | `"08:00"` | формат `HH:MM` | Время напоминания |
+| `admin_vk_ids_raw` | `str` | `""` | — | Список VK ID администраторов через запятую |
 | `data_path` | `str` | `"data.json"` | — | Путь к JSON-файлу хранилища |
+
+### Properties
+
+| Property | Тип | Описание |
+|----------|-----|----------|
+| `admin_vk_ids` | `list[int]` | Распарсенный список VK ID администраторов |
+
+### Methods
+
+```python
+def is_admin(self, vk_id: int) -> bool
+```
+
+Возвращает `True`, если *vk_id* присутствует в `admin_vk_ids`.
 
 ### Валидаторы
 
@@ -118,6 +133,12 @@ JSON-хранилище участников. Безопасен в рамках
 #### `async list_entries(self) -> list[Entry]`
 
 Возвращает неглубокую копию списка участников.
+
+**Сложность:** O(n).
+
+#### `async remove_by_name(self, name: str) -> bool`
+
+Удаляет первую запись с точным совпадением `name` (UserEntry или FriendEntry). Возвращает `True` если удалён.
 
 **Сложность:** O(n).
 
@@ -255,6 +276,28 @@ JSON-хранилище участников. Безопасен в рамках
 
 > **Важно:** VK callback-кнопки не отправляют текстовое сообщение в чат. Они генерируют событие `message_event`, которое ловится через `raw_event`. Обработка происходит «тихо» — пользователь видит только снэкбар или новое сообщение от бота.
 
+### Админ-хендлеры
+
+Требуют `config.is_admin(msg.from_id) == True`. Доступны только пользователям из `ADMIN_VK_IDS_RAW`.
+
+#### `admin_clear` — `text=["очистить", "сбросить"]`
+
+- Проверяет права администратора через `config.is_admin(msg.from_id)`
+- Вызывает `storage.clear()`
+- Отвечает: `"Список участников очищен."`
+
+#### `admin_remove` — `RegexRule(r"^(?:убрать|удалить)\s+(.+)$")`
+
+- Проверяет права администратора
+- Извлекает имя из текста сообщения
+- Вызывает `storage.remove_by_name(name)`
+- Отвечает подтверждением или `"Такого участника не нашлось."`
+
+#### `admin_help` — `text=["админ помощь", "admin help"]`
+
+- Проверяет права администратора
+- Отправляет список админ-команд
+
 ---
 
 ## `src/scheduler.py`
@@ -323,7 +366,7 @@ async def main() -> None:
     config = Config()
     storage = Storage(Path(config.data_path))
     bot = Bot(config.vk_token)
-    setup_handlers(bot, storage)
+    setup_handlers(bot, storage, config)
     
     async with anyio.create_task_group() as tg:
         tg.start_soon(run_scheduler, bot.api, config, storage)

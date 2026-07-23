@@ -20,6 +20,7 @@
 | `REMIND_ENABLED` | `bool` | `true` | Включить напоминание перед сбором |
 | `REMIND_WEEKDAY` | `int` (0–6) | `0` | День недели напоминания: `0`=Понедельник, `6`=Воскресенье |
 | `REMIND_TIME` | `str` (HH:MM) | `08:00` | Локальное время напоминания. Тот же формат и валидация, что и `COLLECT_TIME` |
+| `ADMIN_VK_IDS_RAW` | `str` | `""` | Список VK ID администраторов через запятую. Имеют доступ к админ-командам |
 | `DATA_PATH` | `str` | `data.json` локально, `/app/data/participants.json` в Docker | Путь к JSON-файлу со списком участников |
 
 ## Файл `.env.example`
@@ -32,6 +33,7 @@ COLLECT_TIME=10:00
 REMIND_ENABLED=true
 REMIND_WEEKDAY=0
 REMIND_TIME=08:00
+ADMIN_VK_IDS_RAW=123456789,987654321
 DATA_PATH=data.json
 ```
 

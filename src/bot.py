@@ -7,6 +7,7 @@ from vkbottle import GroupEventType, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
 from vkbottle.dispatch.rules.base import PayloadRule, RegexRule
 
+from src.config import Config
 from src.formatting import format_entries, help_text
 from src.keyboard import build_inline_keyboard
 from src.storage import Storage
@@ -19,7 +20,17 @@ def extract_friend_name(text: str) -> str:
     return text[1:].strip()
 
 
-def setup_handlers(bot: Bot, storage: Storage) -> None:  # noqa: C901,PLR0915
+def _admin_help_text() -> str:
+    """Return the admin command help text."""
+    return (
+        "Админ-команды:\n"
+        "очистить / сбросить — очистить список участников\n"
+        "убрать Имя / удалить Имя — удалить участника по имени\n"
+        "админ помощь — показать эту справку"
+    )
+
+
+def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa: C901,PLR0915
     """Register message handlers on the bot instance."""
     inline_keyboard = build_inline_keyboard()
 
@@ -159,5 +170,59 @@ def setup_handlers(bot: Bot, storage: Storage) -> None:  # noqa: C901,PLR0915
     async def cb_help(event: MessageEvent) -> None:
         _ = await event.send_message(
             message=help_text(compact=True),
+            keyboard=inline_keyboard,
+        )
+
+    # --- Admin handlers ---
+
+    @bot.on.message(text=["очистить", "сбросить"])
+    async def admin_clear(msg: Message) -> None:
+        if not config.is_admin(msg.from_id):
+            _LOGGER.warning("Unauthorized clear attempt from %s", msg.from_id)
+            _ = await msg.answer(
+                "Только администраторы могут использовать эту команду.",
+                keyboard=inline_keyboard,
+            )
+            return
+        await storage.clear()
+        _LOGGER.info("List cleared by admin %s", msg.from_id)
+        _ = await msg.answer(
+            "Список участников очищен.",
+            keyboard=inline_keyboard,
+        )
+
+    @bot.on.message(RegexRule(r"^(?:убрать|удалить)\s+(.+)$"))
+    async def admin_remove(msg: Message) -> None:
+        if not config.is_admin(msg.from_id):
+            _LOGGER.warning("Unauthorized remove attempt from %s", msg.from_id)
+            _ = await msg.answer(
+                "Только администраторы могут использовать эту команду.",
+                keyboard=inline_keyboard,
+            )
+            return
+        name = (msg.text or "").split(maxsplit=1)[1].strip()
+        if await storage.remove_by_name(name):
+            _LOGGER.info("Admin %s removed %s", msg.from_id, name)
+            _ = await msg.answer(
+                f"{name} убран(а) из списка.",
+                keyboard=inline_keyboard,
+            )
+        else:
+            _ = await msg.answer(
+                "Такого участника не нашлось.",
+                keyboard=inline_keyboard,
+            )
+
+    @bot.on.message(text=["админ помощь", "admin help"])
+    async def admin_help(msg: Message) -> None:
+        if not config.is_admin(msg.from_id):
+            _LOGGER.warning("Unauthorized admin_help attempt from %s", msg.from_id)
+            _ = await msg.answer(
+                "Только администраторы могут использовать эту команду.",
+                keyboard=inline_keyboard,
+            )
+            return
+        _ = await msg.answer(
+            _admin_help_text(),
             keyboard=inline_keyboard,
         )

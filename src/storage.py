@@ -119,6 +119,16 @@ class Storage:
         async with self._lock:
             return list(self._entries)
 
+    async def remove_by_name(self, name: str) -> bool:
+        """Remove the first entry matching *name* (user or friend)."""
+        async with self._lock:
+            for i, e in enumerate(self._entries):
+                if e.name == name:
+                    _ = self._entries.pop(i)
+                    await self._save()
+                    return True
+            return False
+
     async def clear(self) -> None:
         """Clear all entries and persist."""
         async with self._lock:

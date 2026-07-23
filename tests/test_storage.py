@@ -115,3 +115,22 @@ async def test_storage_rejects_friend_when_entry_limit_reached(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="Participant limit"):
         await storage.add_friend("Overflow")
+
+
+@pytest.mark.anyio
+async def test_storage_remove_by_name_removes_user_or_friend(
+    tmp_path: Path,
+) -> None:
+    """remove_by_name deletes the first entry matching the name."""
+    storage = Storage(tmp_path / "participants.json")
+    await storage.add_user(1, "Alice")
+    await storage.add_friend("Bob")
+
+    assert await storage.remove_by_name("Alice") is True
+    entries = await storage.list_entries()
+    assert [e.name for e in entries] == ["Bob"]
+
+    assert await storage.remove_by_name("Bob") is True
+    assert await storage.list_entries() == []
+
+    assert await storage.remove_by_name("Charlie") is False

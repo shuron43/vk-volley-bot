@@ -54,6 +54,10 @@ class Config(BaseSettings):
         default="data.json",
         description="Path to JSON storage file",
     )
+    admin_vk_ids_raw: str = Field(
+        default="",
+        description="Comma-separated VK user IDs with admin rights",
+    )
 
     @property
     def path(self) -> Path:
@@ -79,6 +83,17 @@ class Config(BaseSettings):
     def remind_minute(self) -> int:
         """Minute component of ``remind_time`` (0-59)."""
         return int(self.remind_time.split(":")[1])
+
+    @property
+    def admin_vk_ids(self) -> list[int]:
+        """Parsed admin VK IDs from the raw comma-separated string."""
+        if not self.admin_vk_ids_raw:
+            return []
+        return [int(x.strip()) for x in self.admin_vk_ids_raw.split(",")]
+
+    def is_admin(self, vk_id: int) -> bool:
+        """Return whether *vk_id* is in the admin list."""
+        return vk_id in self.admin_vk_ids
 
     @field_validator("data_path")
     @classmethod

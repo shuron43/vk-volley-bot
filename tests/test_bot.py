@@ -4,6 +4,7 @@ import json
 
 import pytest
 from src.bot import (
+    _admin_help_text,
     build_inline_keyboard,
     extract_friend_name,
     format_entries,
@@ -87,3 +88,12 @@ def test_build_inline_keyboard_when_serialized() -> None:
 
     # Then: VK can consume it as JSON.
     assert isinstance(json.loads(keyboard), dict)
+
+
+def test_admin_help_text_contains_commands() -> None:
+    """Admin help lists every documented admin command."""
+    text = _admin_help_text()
+    assert "очистить" in text
+    assert "сбросить" in text
+    assert "убрать" in text
+    assert "удалить" in text

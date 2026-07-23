@@ -160,3 +160,31 @@ def test_config_remind_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.remind_time == "08:00"
     assert config.remind_hour == 8
     assert config.remind_minute == 0
+
+
+@pytest.mark.parametrize(
+    "admin_vk_ids_raw",
+    ["", "123456789", "123456789,987654321"],
+)
+def test_config_accepts_valid_admin_vk_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    admin_vk_ids_raw: str,
+) -> None:
+    """Config parses comma-separated admin VK IDs."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_VK_IDS_RAW", admin_vk_ids_raw)
+
+    config = Config()
+    expected = [int(x) for x in admin_vk_ids_raw.split(",")] if admin_vk_ids_raw else []
+    assert config.admin_vk_ids == expected
+
+
+def test_config_is_admin_checks_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    """is_admin returns True only for configured VK IDs."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_VK_IDS_RAW", "123,456")
+
+    config = Config()
+    assert config.is_admin(123) is True
+    assert config.is_admin(456) is True
+    assert config.is_admin(789) is False
