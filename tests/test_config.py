@@ -162,6 +162,21 @@ def test_config_remind_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.remind_minute == 0
 
 
+def test_config_rejects_enabled_reminder_at_collection_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabled collection and reminder events cannot occupy one instant."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("COLLECT_WEEKDAY", "2")
+    monkeypatch.setenv("COLLECT_TIME", "10:00")
+    monkeypatch.setenv("REMIND_ENABLED", "true")
+    monkeypatch.setenv("REMIND_WEEKDAY", "2")
+    monkeypatch.setenv("REMIND_TIME", "10:00")
+
+    with pytest.raises(ValidationError, match="remind_time"):
+        Config()
+
+
 @pytest.mark.parametrize(
     "admin_vk_ids_raw",
     ["", "123456789", "123456789,987654321"],
@@ -175,8 +190,26 @@ def test_config_accepts_valid_admin_vk_ids(
     monkeypatch.setenv("ADMIN_VK_IDS_RAW", admin_vk_ids_raw)
 
     config = Config()
-    expected = [int(x) for x in admin_vk_ids_raw.split(",")] if admin_vk_ids_raw else []
+    expected = (
+        tuple(int(x) for x in admin_vk_ids_raw.split(",")) if admin_vk_ids_raw else ()
+    )
     assert config.admin_vk_ids == expected
+
+
+@pytest.mark.parametrize(
+    "admin_vk_ids_raw",
+    ["123,", ",123", "123,,456", "abc", "0", "-1"],
+)
+def test_config_rejects_invalid_admin_vk_ids_during_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    admin_vk_ids_raw: str,
+) -> None:
+    """Malformed or non-positive admin IDs fail at the settings boundary."""
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_VK_IDS_RAW", admin_vk_ids_raw)
+
+    with pytest.raises(ValidationError, match="ADMIN_VK_IDS_RAW"):
+        Config()
 
 
 def test_config_is_admin_checks_membership(monkeypatch: pytest.MonkeyPatch) -> None:

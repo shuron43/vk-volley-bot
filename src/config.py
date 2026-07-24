@@ -1,19 +1,23 @@
 """Application configuration loaded from environment variables."""
 
 from pathlib import Path
-from typing import ClassVar, Final
+from typing import Annotated, ClassVar, Final, Self
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _MAX_WEEKDAY: Final = 6
 _WEEKDAY_ERROR_MSG = "Weekday must be between 0 (Monday) and 6 (Sunday)"
-_COLLECT_TIME_ERROR_MSG = (
-    "collect_time must be HH:MM with hour 00-23 and minute 00-59"
-)
+_COLLECT_TIME_ERROR_MSG = "collect_time must be HH:MM with hour 00-23 and minute 00-59"
 _MAX_HOUR: Final = 23
 _MAX_MINUTE: Final = 59
 _DATA_PATH_ERROR_MSG = "data_path must not contain path traversal"
+_SCHEDULE_COLLISION_ERROR_MSG = (
+    "remind_time must not equal collect_time on the same weekday"
+)
+_ADMIN_IDS_ERROR_MSG = "admin_vk_ids must be comma-separated positive integers"
+_AdminVkId = Annotated[int, Field(gt=0)]
+_AdminVkIds = Annotated[tuple[_AdminVkId, ...], NoDecode]
 
 
 class Config(BaseSettings):
@@ -23,6 +27,7 @@ class Config(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         frozen=False,
+        populate_by_name=True,
     )
 
     vk_token: str = Field(description="VK community API token")
@@ -54,8 +59,9 @@ class Config(BaseSettings):
         default="data.json",
         description="Path to JSON storage file",
     )
-    admin_vk_ids_raw: str = Field(
-        default="",
+    admin_vk_ids: _AdminVkIds = Field(
+        default=(),
+        validation_alias="ADMIN_VK_IDS_RAW",
         description="Comma-separated VK user IDs with admin rights",
     )
 
@@ -84,16 +90,33 @@ class Config(BaseSettings):
         """Minute component of ``remind_time`` (0-59)."""
         return int(self.remind_time.split(":")[1])
 
-    @property
-    def admin_vk_ids(self) -> list[int]:
-        """Parsed admin VK IDs from the raw comma-separated string."""
-        if not self.admin_vk_ids_raw:
-            return []
-        return [int(x.strip()) for x in self.admin_vk_ids_raw.split(",")]
-
     def is_admin(self, vk_id: int) -> bool:
         """Return whether *vk_id* is in the admin list."""
         return vk_id in self.admin_vk_ids
+
+    @field_validator("admin_vk_ids", mode="before")
+    @classmethod
+    def _parse_admin_vk_ids(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        if not value.strip():
+            return ()
+        parts = tuple(part.strip() for part in value.split(","))
+        if any(not part for part in parts):
+            raise ValueError(_ADMIN_IDS_ERROR_MSG)
+        return parts
+
+    @model_validator(mode="after")
+    def _validate_schedule_collision(self) -> Self:
+        if self.remind_enabled and (
+            self.collect_weekday,
+            self.collect_time,
+        ) == (
+            self.remind_weekday,
+            self.remind_time,
+        ):
+            raise ValueError(_SCHEDULE_COLLISION_ERROR_MSG)
+        return self
 
     @field_validator("data_path")
     @classmethod
