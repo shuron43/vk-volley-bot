@@ -4,6 +4,7 @@ import datetime
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Final, NoReturn
 
 import anyio
@@ -35,9 +36,7 @@ def _next_target(
     return target + datetime.timedelta(days=days_ahead)
 
 
-async def _send_announcement(
-    api: API, config: Config, inline_keyboard: str
-) -> None:
+async def _send_announcement(api: API, config: Config, inline_keyboard: str) -> None:
     """Send the weekly collection announcement to the configured chat."""
     _ = await api.messages.send(
         peer_id=config.chat_peer_id,
@@ -114,10 +113,6 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
                 config.remind_hour,
                 config.remind_minute,
             )
-            # If reminder falls on the same instant as collection, push it
-            # to the next week so collection always takes priority.
-            if remind_target == collect_target:
-                remind_target += datetime.timedelta(days=7)
         else:
             remind_target = None
 
@@ -132,29 +127,13 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
         await anyio.sleep(sleep_seconds)
 
         if event == "collect":
+            await storage.clear()
             await _run_with_retry(
                 "Weekly announcement",
-                _announcement_op(api, config, inline_keyboard, storage),
+                partial(_send_announcement, api, config, inline_keyboard),
             )
         else:
             await _run_with_retry(
                 "Weekly reminder",
-                _reminder_op(api, config, inline_keyboard, storage),
+                partial(_send_reminder, api, config, inline_keyboard, storage),
             )
-
-
-def _announcement_op(
-    api: API, config: Config, inline_keyboard: str, storage: Storage
-) -> Callable[[], Awaitable[None]]:
-    async def _op() -> None:
-        await storage.clear()
-        await _send_announcement(api, config, inline_keyboard)
-    return _op
-
-
-def _reminder_op(
-    api: API, config: Config, inline_keyboard: str, storage: Storage
-) -> Callable[[], Awaitable[None]]:
-    async def _op() -> None:
-        await _send_reminder(api, config, inline_keyboard, storage)
-    return _op

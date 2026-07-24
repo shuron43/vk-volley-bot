@@ -196,3 +196,35 @@ async def test_scheduler_retries_announcement_after_failure(
     assert api.messages.send.await_count == 2
     assert sleep_durations == [3600.0, 300.0, 3600.0]
     assert "Weekly announcement failed; retrying in five minutes" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_scheduler_clears_once_when_announcement_send_is_retried(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a collection delivery that fails once before succeeding
+    api = MagicMock()
+    api.messages.send = AsyncMock(side_effect=[OSError("VK unavailable"), 1])
+    storage = MagicMock(spec=Storage)
+    storage.clear = AsyncMock()
+    sleep_durations: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_durations.append(seconds)
+        if len(sleep_durations) == 3:
+            raise StopSchedulerError
+
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
+    )
+    monkeypatch.setattr(scheduler.anyio, "sleep", fake_sleep)
+
+    # When: the announcement send is retried
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(api, config, storage)
+
+    # Then: participant state is cleared only once for that collection event
+    storage.clear.assert_awaited_once_with()
