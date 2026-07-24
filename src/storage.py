@@ -55,14 +55,12 @@ class Storage:
         data = _StorageData.model_validate_json(self._path.read_bytes())
         self._entries = list(data.participants)
 
-    async def _save(self) -> None:
-        data = _StorageData(participants=tuple(self._entries))
+    async def _save(self, entries: list[Entry]) -> None:
+        data = _StorageData(participants=tuple(entries))
         temp_path = self._path.with_suffix(".tmp")
 
         def _write() -> None:
-            _ = temp_path.write_text(
-                data.model_dump_json(indent=2), encoding="utf-8"
-            )
+            _ = temp_path.write_text(data.model_dump_json(indent=2), encoding="utf-8")
             _ = temp_path.replace(self._path)
 
         try:
@@ -70,6 +68,10 @@ class Storage:
         except OSError:
             _LOGGER.exception("Failed to persist storage to %s", self._path)
             raise
+
+    async def _commit(self, entries: list[Entry]) -> None:
+        await self._save(entries)
+        self._entries = entries
 
     async def add_user(self, vk_id: int, name: str) -> bool:
         """Add a VK user if not already present. Returns True if added."""
@@ -80,8 +82,11 @@ class Storage:
                 return False
             if len(self._entries) >= _MAX_ENTRIES:
                 raise ValueError(_LIMIT_REACHED_MSG)
-            self._entries.append(UserEntry(kind="user", vk_id=vk_id, name=name))
-            await self._save()
+            entries = [
+                *self._entries,
+                UserEntry(kind="user", vk_id=vk_id, name=name),
+            ]
+            await self._commit(entries)
             return True
 
     async def remove_user(self, vk_id: int) -> bool:
@@ -89,8 +94,9 @@ class Storage:
         async with self._lock:
             for i, e in enumerate(self._entries):
                 if e.kind == "user" and e.vk_id == vk_id:
-                    _ = self._entries.pop(i)
-                    await self._save()
+                    entries = self._entries.copy()
+                    _ = entries.pop(i)
+                    await self._commit(entries)
                     return True
             return False
 
@@ -101,16 +107,17 @@ class Storage:
         async with self._lock:
             if len(self._entries) >= _MAX_ENTRIES:
                 raise ValueError(_LIMIT_REACHED_MSG)
-            self._entries.append(FriendEntry(kind="friend", name=name))
-            await self._save()
+            entries = [*self._entries, FriendEntry(kind="friend", name=name)]
+            await self._commit(entries)
 
     async def remove_friend(self, name: str) -> bool:
         """Remove a friend by exact name. Returns True if removed."""
         async with self._lock:
             for i, e in enumerate(self._entries):
                 if e.kind == "friend" and e.name == name:
-                    _ = self._entries.pop(i)
-                    await self._save()
+                    entries = self._entries.copy()
+                    _ = entries.pop(i)
+                    await self._commit(entries)
                     return True
             return False
 
@@ -124,13 +131,13 @@ class Storage:
         async with self._lock:
             for i, e in enumerate(self._entries):
                 if e.name == name:
-                    _ = self._entries.pop(i)
-                    await self._save()
+                    entries = self._entries.copy()
+                    _ = entries.pop(i)
+                    await self._commit(entries)
                     return True
             return False
 
     async def clear(self) -> None:
         """Clear all entries and persist."""
         async with self._lock:
-            self._entries.clear()
-            await self._save()
+            await self._commit([])

@@ -3,10 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, assert_never
 
 import pytest
 from src.storage import Storage
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+type _Mutation = Literal[
+    "add_user",
+    "remove_user",
+    "add_friend",
+    "remove_friend",
+    "remove_by_name",
+    "clear",
+]
 
 
 @pytest.mark.anyio
@@ -49,6 +63,63 @@ async def test_storage_preserves_original_when_atomic_replace_fails(
         await storage.add_friend("Bob")
 
     assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "add_user",
+        "remove_user",
+        "add_friend",
+        "remove_friend",
+        "remove_by_name",
+        "clear",
+    ],
+)
+@pytest.mark.anyio
+async def test_storage_preserves_live_state_when_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: _Mutation,
+) -> None:
+    """A failed durable write leaves both live and persisted state unchanged."""
+    # Given: two persisted entries and a failing atomic replacement
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    assert await storage.add_user(1, "Alice") is True
+    await storage.add_friend("Bob")
+
+    def fail_replace(self: Path, _target: Path) -> Path:
+        message = "cannot replace"
+        raise OSError(message)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    operation: Callable[[], Awaitable[object]]
+    match mutation:
+        case "add_user":
+            operation = partial(storage.add_user, 2, "Carol")
+        case "remove_user":
+            operation = partial(storage.remove_user, 1)
+        case "add_friend":
+            operation = partial(storage.add_friend, "Carol")
+        case "remove_friend":
+            operation = partial(storage.remove_friend, "Bob")
+        case "remove_by_name":
+            operation = partial(storage.remove_by_name, "Alice")
+        case "clear":
+            operation = storage.clear
+        case unreachable:
+            assert_never(unreachable)
+
+    # When: any mutating operation cannot persist its candidate state
+    with pytest.raises(OSError, match="cannot replace"):
+        await operation()
+
+    # Then: neither the live object nor a fresh reader observes the mutation
+    live_entries = await storage.list_entries()
+    persisted_entries = await Storage(path).list_entries()
+    assert [entry.name for entry in live_entries] == ["Alice", "Bob"]
+    assert [entry.name for entry in persisted_entries] == ["Alice", "Bob"]
 
 
 @pytest.mark.anyio
