@@ -1,7 +1,9 @@
 """VK bot message handlers."""
 
 import logging
-from typing import Final
+from collections.abc import Awaitable, Callable
+from functools import wraps
+from typing import Final, TypeVar
 
 from vkbottle import GroupEventType, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
@@ -13,6 +15,7 @@ from src.keyboard import build_inline_keyboard
 from src.storage import Storage
 
 _LOGGER: Final = logging.getLogger(__name__)
+_EventT = TypeVar("_EventT", Message, MessageEvent)
 
 
 def extract_friend_name(text: str) -> str:
@@ -34,7 +37,18 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     """Register message handlers on the bot instance."""
     inline_keyboard = build_inline_keyboard()
 
+    def target_peer_only(
+        handler: Callable[[_EventT], Awaitable[None]],
+    ) -> Callable[[_EventT], Awaitable[None]]:
+        @wraps(handler)
+        async def guarded(event: _EventT) -> None:
+            if event.peer_id == config.chat_peer_id:
+                await handler(event)
+
+        return guarded
+
     @bot.on.message(text=["+", "записаться"])
+    @target_peer_only
     async def sign_up(msg: Message) -> None:
         # Duplicates cb_join — keep in sync.
         try:
@@ -56,6 +70,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             _ = await msg.answer(str(exc), keyboard=inline_keyboard)
 
     @bot.on.message(text=["-", "отписаться"])
+    @target_peer_only
     async def sign_off(msg: Message) -> None:
         # Duplicates cb_leave — keep in sync.
         if await storage.remove_user(msg.from_id):
@@ -64,6 +79,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             _ = await msg.answer("Тебя не было в списке.", keyboard=inline_keyboard)
 
     @bot.on.message(RegexRule(r"^\+\s*(.+)$"))
+    @target_peer_only
     async def add_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
         if not name:
@@ -83,6 +99,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             _ = await msg.answer(str(exc), keyboard=inline_keyboard)
 
     @bot.on.message(RegexRule(r"^-\s*(.+)$"))
+    @target_peer_only
     async def remove_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
         if await storage.remove_friend(name):
@@ -98,6 +115,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             )
 
     @bot.on.message(text=["список", "участники", "кто идёт"])
+    @target_peer_only
     async def show_list(msg: Message) -> None:
         # Duplicates cb_list — keep in sync.
         entries = await storage.list_entries()
@@ -108,6 +126,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         )
 
     @bot.on.message(text=["?", "help", "помощь", "команды"])
+    @target_peer_only
     async def help_cmd(msg: Message) -> None:
         _ = await msg.answer(help_text(), keyboard=inline_keyboard)
 
@@ -118,6 +137,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         MessageEvent,
         PayloadRule({"cmd": "join"}),
     )
+    @target_peer_only
     async def cb_join(event: MessageEvent) -> None:
         # Duplicates sign_up — keep in sync.
         try:
@@ -142,6 +162,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         MessageEvent,
         PayloadRule({"cmd": "leave"}),
     )
+    @target_peer_only
     async def cb_leave(event: MessageEvent) -> None:
         # Duplicates sign_off — keep in sync.
         if await storage.remove_user(event.user_id):
@@ -154,6 +175,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         MessageEvent,
         PayloadRule({"cmd": "list"}),
     )
+    @target_peer_only
     async def cb_list(event: MessageEvent) -> None:
         # Duplicates show_list — keep in sync.
         entries = await storage.list_entries()
@@ -167,6 +189,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         MessageEvent,
         PayloadRule({"cmd": "help"}),
     )
+    @target_peer_only
     async def cb_help(event: MessageEvent) -> None:
         _ = await event.send_message(
             message=help_text(compact=True),
@@ -176,6 +199,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     # --- Admin handlers ---
 
     @bot.on.message(text=["очистить", "сбросить"])
+    @target_peer_only
     async def admin_clear(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized clear attempt from %s", msg.from_id)
@@ -192,6 +216,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         )
 
     @bot.on.message(RegexRule(r"^(?:убрать|удалить)\s+(.+)$"))
+    @target_peer_only
     async def admin_remove(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized remove attempt from %s", msg.from_id)
@@ -214,6 +239,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             )
 
     @bot.on.message(text=["админ помощь", "admin help"])
+    @target_peer_only
     async def admin_help(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized admin_help attempt from %s", msg.from_id)

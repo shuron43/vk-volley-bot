@@ -1,6 +1,10 @@
 """Unit tests for bot presentation helpers."""
 
+from __future__ import annotations
+
 import json
+import secrets
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from src.bot import (
@@ -9,8 +13,12 @@ from src.bot import (
     extract_friend_name,
     format_entries,
     help_text,
+    setup_handlers,
 )
-from src.storage import FriendEntry, UserEntry
+from src.config import Config
+from src.storage import FriendEntry, Storage, UserEntry
+from vkbottle import GroupEventType
+from vkbottle.bot import Bot, Message, MessageEvent
 
 
 @pytest.mark.parametrize(
@@ -97,3 +105,66 @@ def test_admin_help_text_contains_commands() -> None:
     assert "сбросить" in text
     assert "убрать" in text
     assert "удалить" in text
+
+
+@pytest.mark.anyio
+async def test_message_handlers_ignore_events_from_other_peers() -> None:
+    # Given: every registered message handler receives an event from another peer.
+    peer_id = 2_000_000_001
+    config = Config(
+        vk_token=secrets.token_urlsafe(),
+        chat_peer_id=peer_id,
+        admin_vk_ids=(123,),
+    )
+    storage = MagicMock(spec=Storage)
+    bot = Bot(config.vk_token)
+    api = MagicMock()
+    api.users.get = AsyncMock(return_value=[])
+    bot.api = api
+    setup_handlers(bot, storage, config)
+    message = MagicMock(spec=Message)
+    message.peer_id = peer_id + 1
+    message.from_id = 123
+    message.text = "+ OutsidePeer"
+    message.answer = AsyncMock()
+
+    # When: handlers are called through the functions registered with VKBottle.
+    for registered in bot.labeler.message_view.handlers:
+        await registered.handler(message)
+
+    # Then: no data, VK API, or response surface is touched.
+    assert storage.mock_calls == []
+    api.users.get.assert_not_awaited()
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_callback_handlers_ignore_events_from_other_peers() -> None:
+    # Given: every callback handler receives an event from another peer.
+    peer_id = 2_000_000_001
+    config = Config(
+        vk_token=secrets.token_urlsafe(),
+        chat_peer_id=peer_id,
+    )
+    storage = MagicMock(spec=Storage)
+    bot = Bot(config.vk_token)
+    api = MagicMock()
+    api.users.get = AsyncMock(return_value=[])
+    bot.api = api
+    setup_handlers(bot, storage, config)
+    event = MagicMock(spec=MessageEvent)
+    event.peer_id = peer_id + 1
+    event.user_id = 123
+    event.show_snackbar = AsyncMock()
+    event.send_message = AsyncMock()
+
+    # When: handlers are called through the functions registered with VKBottle.
+    callbacks = bot.labeler.raw_event_view.handlers[GroupEventType.MESSAGE_EVENT]
+    for registered in callbacks:
+        await registered.handler.handler(event)
+
+    # Then: no data, VK API, or response surface is touched.
+    assert storage.mock_calls == []
+    api.users.get.assert_not_awaited()
+    event.show_snackbar.assert_not_awaited()
+    event.send_message.assert_not_awaited()
