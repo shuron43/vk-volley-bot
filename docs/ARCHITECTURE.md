@@ -45,9 +45,10 @@
 3. **vkbottle** (`bot.py`) маршрутизирует событие по правилам:
    - Exact text / Regex → text handlers
    - `PayloadRule` → callback handlers
-4. Хендлер асинхронно вызывает методы `Storage` для чтения/записи
-5. `Storage` атомарно обновляет JSON-файл на диске (tempfile + replace)
-6. Бот отправляет ответ:
+4. Общий peer-guard сравнивает `event.peer_id` с `CHAT_PEER_ID`; чужие события прекращаются до любых чтений, записей или ответов
+5. Хендлер асинхронно вызывает методы `Storage` для чтения/записи
+6. `Storage` атомарно обновляет JSON-файл на диске (tempfile + replace)
+7. Бот отправляет ответ:
    - Текстовые команды → `msg.answer(..., keyboard=inline_keyboard)`
    - Callback-кнопки → `event.show_snackbar(...)` или `event.send_message(...)`
 
@@ -76,6 +77,7 @@ main.py
 - Graceful shutdown при получении сигнала SIGINT/SIGTERM
 - `Storage` является общим ресурсом; все публичные методы асинхронны и защищены `asyncio.Lock`
 - Планировщик устойчив к сбоям VK API: при ошибке повторяет попытку каждые 5 минут
+- Для сбора очистка выполняется один раз до retry; повторяется только отправка анонса
 
 ## Хранилище
 
@@ -99,6 +101,9 @@ main.py
 2. Вызывает `replace()` для атомарной замены
 
 При падении процесса во время записи оригинальный файл остаётся неповреждённым.
+Мутации сначала формируют новый список-кандидат и сохраняют его. Живое состояние
+заменяется только после успешного `replace()`, поэтому ошибка записи не создаёт
+расхождение между памятью и диском.
 
 ### Почему JSON, а не БД?
 
@@ -119,6 +124,7 @@ main.py
 ## Безопасность
 
 - Токен VK хранится только в переменных окружения (`.env` в `.gitignore`)
+- Все команды и callback-события ограничены одним настроенным `CHAT_PEER_ID`
 - `random_id` для VK API генерируется через `secrets.randbelow()` (криптографически безопасный)
 - Нет eval/exec, нет динамических импортов
 - JSON парсится через Pydantic — инъекция невозможна
@@ -138,6 +144,6 @@ main.py
 Каждый модуль изолирован и покрыт тестами:
 - `Config` — `tests/test_config.py`: валидация `collect_weekday` и `collect_time`
 - `Storage` — `tests/test_storage.py`: операции add/remove/clear на временном файле (`tmp_path`)
-- `bot.py` — `tests/test_bot.py`: хендлеры с мокированием VK API и `Storage`
+- `bot.py` — `tests/test_bot.py` и `tests/test_bot_handlers.py`: peer-guard и зарегистрированные хендлеры с реальным временным `Storage`
 - `scheduler.py` — `tests/test_scheduler.py`: чистая логика `_next_target` без sleep, dual-event loop (collect + remind)
 - `test_smoke.py` — интеграционный импорт всех модулей

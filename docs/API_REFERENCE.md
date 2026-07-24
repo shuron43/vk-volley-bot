@@ -16,6 +16,10 @@ class Config(BaseSettings):
     chat_peer_id: int
     collect_weekday: int = 2
     collect_time: str = "10:00"
+    remind_enabled: bool = True
+    remind_weekday: int = 0
+    remind_time: str = "08:00"
+    admin_vk_ids: tuple[int, ...] = ()  # env: ADMIN_VK_IDS_RAW
     data_path: str = "data.json"
 ```
 
@@ -28,14 +32,8 @@ class Config(BaseSettings):
 | `remind_enabled` | `bool` | `true` | — | Включить напоминание перед сбором |
 | `remind_weekday` | `int` | `0` | `0 <= v <= 6` | День недели напоминания |
 | `remind_time` | `str` | `"08:00"` | формат `HH:MM` | Время напоминания |
-| `admin_vk_ids_raw` | `str` | `""` | — | Список VK ID администраторов через запятую |
+| `admin_vk_ids` | `tuple[int, ...]` | `()` | Положительные ID; `ADMIN_VK_IDS_RAW` парсится при старте | Неизменяемый набор VK ID администраторов |
 | `data_path` | `str` | `"data.json"` | — | Путь к JSON-файлу хранилища |
-
-### Properties
-
-| Property | Тип | Описание |
-|----------|-----|----------|
-| `admin_vk_ids` | `list[int]` | Распарсенный список VK ID администраторов |
 
 ### Methods
 
@@ -62,6 +60,10 @@ def _validate_time(cls, v: str) -> str
 ```
 
 Выбрасывает `ValueError` если время не в формате `HH:MM`, часы вне `0–23` или минуты вне `0–59`.
+
+`_parse_admin_vk_ids` разбирает `ADMIN_VK_IDS_RAW` в tuple положительных целых
+ID. `_validate_schedule_collision` запрещает включённому напоминанию совпадать
+с моментом сбора.
 
 ---
 
@@ -102,9 +104,14 @@ JSON-хранилище участников. Безопасен в рамках
 
 Приватный. Десериализует JSON из `self._path` через `_StorageData.model_validate_json()`.
 
-#### `_save(self) -> None`
+#### `_save(self, entries: list[Entry]) -> None`
 
-Приватный. Сериализует текущий список в JSON с отступами (`indent=2`), пишет во временный файл и атомарно перемещает через `replace()`.
+Приватный. Сериализует список-кандидат в JSON, пишет во временный файл и атомарно перемещает через `replace()`.
+
+#### `_commit(self, entries: list[Entry]) -> None`
+
+Сначала сохраняет кандидат, затем заменяет `_entries`. При ошибке записи живое
+и дисковое состояния остаются прежними.
 
 #### `async add_user(self, vk_id: int, name: str) -> bool`
 
@@ -172,9 +179,10 @@ JSON-хранилище участников. Безопасен в рамках
 
 Извлекает и обрезает имя друга после символа `+` или `-`.
 
-### `setup_handlers(bot: Bot, storage: Storage) -> None`
+### `setup_handlers(bot: Bot, storage: Storage, config: Config) -> None`
 
-Регистрирует все хендлеры на переданном экземпляре `Bot`. Вызывается один раз при старте. Содержит 6 текстовых хендлеров + 4 callback-хендлера для inline-клавиатуры.
+Регистрирует 9 текстовых и 4 callback-хендлера. Общий wrapper допускает тело
+каждого handler только при `event.peer_id == config.chat_peer_id`.
 
 #### Хендлер `+` / `записаться`
 
@@ -186,7 +194,7 @@ JSON-хранилище участников. Безопасен в рамках
    - `"Ты записался!"` — при успехе
    - `"Ты уже в списке."` — если дубликат
 
-**Особенность:** зависит от VK API для резолва имени. Если VK API вернёт пустой список пользователей или `first_name` отсутствует — используется `"Unknown"`. Исключения `VKAPIError` (недоступность сети, невалидный токен) пробрасываются вверх и обрабатываются vkbottle.
+**Особенность:** зависит от VK API для резолва имени. Если VK API вернёт пустой список пользователей или `first_name` отсутствует — используется `"Unknown"`. `VKAPIError` перехватывается, пользователю отправляется сообщение о временной ошибке.
 
 #### Хендлер `-` / `отписаться`
 
@@ -201,7 +209,7 @@ JSON-хранилище участников. Безопасен в рамках
 
 **Правило:** `@bot.on.message(RegexRule(r"^\+\s*(.+)$"))`
 
-1. Извлекает текст после `+` через `split("+", 1)[1].strip()`.
+1. Извлекает текст после `+` через `extract_friend_name()`.
 2. Если имя пустое — отвечает `"Укажи имя друга: + Имя"`.
 3. Вызывает `storage.add_friend(name)`.
 4. Отвечает `"{name} записан(а) как друг."`.
@@ -332,7 +340,7 @@ JSON-хранилище участников. Безопасен в рамках
    - Берёт `now = datetime.datetime.now()` (локальное время сервера)
    - Вычисляет `collect_target` — время следующего сбора
    - Если `remind_enabled=True`, вычисляет `remind_target` — время напоминания
-   - Если напоминание и сбор совпадают — напоминание сдвигается на неделю (приоритет у сбора)
+   - Совпадающие включённые расписания невозможны: `Config` отклоняет их при старте
 
 2. **Выбор ближайшего события:**
    - Вызывает `_pick_next_event(collect_target, remind_target)`
@@ -342,11 +350,11 @@ JSON-хранилище участников. Безопасен в рамках
    - `await anyio.sleep(sleep_seconds)`
 
 4. **Действие:**
-   - **Сбор** (`event == "collect"`): `await storage.clear()` → отправляет анонс
+   - **Сбор** (`event == "collect"`): один раз вызывает `storage.clear()`, затем отправляет анонс
    - **Напоминание** (`event == "remind"`): отправляет текущий список участников
 
 5. **Обработка ошибок:**
-   - При сбое `OSError`, `TimeoutError` или `VKAPIError` — логирует ошибку, ждёт 5 минут и повторяет шаг 4
+   - При сбое отправки `OSError`, `TimeoutError` или `VKAPIError` — логирует ошибку, ждёт 5 минут и повторяет только отправку
    - При успехе — переходит к шагу 1
 
 **Тип возвращаемого значения:** `NoReturn` — функция никогда не завершается нормально.
@@ -369,8 +377,8 @@ async def main() -> None:
     setup_handlers(bot, storage, config)
     
     async with anyio.create_task_group() as tg:
-        tg.start_soon(run_scheduler, bot.api, config, storage)
-        tg.start_soon(bot.run_polling)
+        _ = tg.start_soon(run_scheduler, bot.api, config, storage)
+        _ = tg.start_soon(bot.run_polling)
 ```
 
 Порядок инициализации:
@@ -394,6 +402,7 @@ async def main() -> None:
 ### Invariant'ы Storage
 
 - `_entries` всегда синхронизирован с файлом `_path`
+- Ошибка сохранения не публикует список-кандидат в `_entries`
 - После любого публичного метода (`add_*`, `remove_*`, `clear`) файл актуален
 - `list_entries()` возвращает копию — изменение возвращённого списка не влияет на хранилище
 
@@ -409,8 +418,8 @@ async def main() -> None:
 |-------|-----------|---------|-----------|
 | `Config()` | `ValidationError` | Невалидные `.env` | Падает при старте |
 | `_StorageData.model_validate_json()` | `ValidationError` | Повреждённый JSON | Падает при старте |
-| `api.users.get()` | `VKAPIError` | Невалидный токен/ID | Ловится vkbottle (сообщение не отправится) |
-| `api.messages.send()` | `VKAPIError` | Нет прав / бот не в чате | Ловится vkbottle |
+| `api.users.get()` | `VKAPIError` | Невалидный токен/ID | Handler отвечает сообщением или snackbar о временной ошибке |
+| `api.messages.send()` в scheduler | `VKAPIError` | Нет прав / временный сбой | Повторяется через 5 минут |
 
 ### Потокобезопасность
 
