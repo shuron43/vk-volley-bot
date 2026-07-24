@@ -25,8 +25,8 @@ async def main() -> None:
     _LOGGER.info("Bot handlers registered")
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(run_scheduler, bot.api, config, storage)
-        tg.start_soon(bot.run_polling)
+        _ = tg.start_soon(run_scheduler, bot.api, config, storage)
+        _ = tg.start_soon(bot.run_polling)
 
 
 if __name__ == "__main__":
