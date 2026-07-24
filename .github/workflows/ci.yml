@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
     branches:
-      - main
+      - master
 
 jobs:
   test:
@@ -36,8 +36,8 @@ jobs:
       - name: Run basedpyright
         run: uv run basedpyright
 
-    - name: Run tests
-      run: uv run pytest
+      - name: Run tests with coverage
+        run: uv run pytest --cov=src --cov-report=term-missing
 
-    - name: Audit dependencies for known CVEs
-      run: uv run pip-audit --desc
+      - name: Audit dependencies for known CVEs
+        run: uv run pip-audit --desc

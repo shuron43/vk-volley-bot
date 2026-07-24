@@ -26,9 +26,7 @@ def test_module_imports_without_error(module_name: str) -> None:
 async def test_main_starts_bot_and_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
     """Given mocked dependencies, main starts both long-running tasks."""
     # Given: constructors and services that do not touch VK or the filesystem.
-    config = MagicMock(
-        vk_token=secrets.token_urlsafe(), data_path="participants.json"
-    )
+    config = MagicMock(vk_token=secrets.token_urlsafe(), data_path="participants.json")
     config.path = Path(config.data_path)
     storage = MagicMock()
     api = MagicMock()
