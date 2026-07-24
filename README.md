@@ -77,6 +77,9 @@ curl "https://api.vk.com/method/messages.getConversations?access_token=$VK_TOKEN
 
 ## Документация
 
+Бот обрабатывает команды и callback-события только из чата, указанного в
+`CHAT_PEER_ID`. События из других peer игнорируются до чтения или изменения данных.
+
 Подробная документация находится в папке [`docs/`](docs/):
 
 | Файл | Что внутри |
@@ -96,11 +99,12 @@ curl "https://api.vk.com/method/messages.getConversations?access_token=$VK_TOKEN
 
 ```bash
 # Линтер и форматтер
-uv run ruff check src
+uv run ruff check src tests
+uv run ruff format --check src tests
 uv run basedpyright
 
-# Тесты
-uv run pytest
+# Тесты и обязательный порог покрытия 80%
+uv run pytest --cov=src --cov-report=term-missing
 
 # Запуск локально
 uv run python -m src.main
@@ -126,7 +130,7 @@ uv run python -m src.main
 - [x] Админ-команды (очистить, удалить участника)
 - [ ] Лимит участников и очередь ожидания
 - [ ] SQLite вместо JSON
-- [ ] CI/CD: GitHub Actions
+- [x] CI: GitHub Actions для ветки `master`
 
 ---
 

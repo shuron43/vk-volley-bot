@@ -13,8 +13,16 @@
 Бота можно запустить прямо на рабочем ПК, чтобы проверить команды и интеграцию с VK:
 
 ```bash
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run basedpyright
+uv run pytest --cov=src --cov-report=term-missing
 uv run python -m src.main
 ```
+
+Перед production-запуском `Config` должен успешно разобрать `.env`. В частности,
+включённое напоминание не может совпадать со сбором, а `ADMIN_VK_IDS_RAW`
+должен содержать только положительные целые ID через запятую.
 
 **Ограничения локального запуска:**
 - ПК должен быть включён и подключён к интернету 24/7. Сон, гибернация или смена Wi-Fi разорвут соединение с VK.
