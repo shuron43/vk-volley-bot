@@ -1,6 +1,7 @@
 """VK bot message handlers."""
 
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Final, TypeVar
@@ -36,47 +37,140 @@ def _admin_help_text() -> str:
 def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa: C901,PLR0915
     """Register message handlers on the bot instance."""
     inline_keyboard = build_inline_keyboard()
+    registration_closed_message = (
+        "Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь»."
+    )
+    bare_plus_instruction = (
+        "Чтобы записаться, нажми «Записаться» или напиши «записаться»"
+    )
+    bare_plus_message = f"{bare_plus_instruction} после анонса. Для друга: + Имя."
+
+    async def join_user(vk_id: int) -> tuple[str, bool]:
+        """Register a VK user and return feedback with its mutation result."""
+        if not await storage.is_registration_open():
+            return registration_closed_message, False
+        try:
+            _users = await bot.api.users.get(user_ids=[vk_id])
+        except VKAPIError:
+            _LOGGER.exception("VK API error fetching user %s", vk_id)
+            return "Не удалось получить данные из VK. Попробуй позже.", False
+        name = (_users[0].first_name or "Unknown") if _users else "Unknown"
+        try:
+            added = await storage.add_user(vk_id, name)
+        except ValueError as exc:
+            return str(exc), False
+        if added:
+            _LOGGER.info("User %s (%s) signed up", vk_id, name)
+            return "Ты записался!", True
+        return "Ты уже в списке.", False
+
+    async def leave_user(vk_id: int) -> tuple[str, bool]:
+        """Remove a VK user and return feedback with its mutation result."""
+        if await storage.remove_user(vk_id):
+            _LOGGER.info("User %s signed off", vk_id)
+            return "Ты отписался.", True
+        return "Тебя не было в списке.", False
+
+    async def add_friend_by_name(name: str) -> str:
+        """Register a friend and return the result message."""
+        if not await storage.is_registration_open():
+            return registration_closed_message
+        try:
+            await storage.add_friend(name)
+        except ValueError as exc:
+            return str(exc)
+        _LOGGER.info("Friend added: %s", name)
+        return f"{name} записан(а) как друг."
+
+    async def remove_friend_by_name(name: str) -> str:
+        """Remove a friend and return the result message."""
+        if await storage.remove_friend(name):
+            _LOGGER.info("Friend removed: %s", name)
+            return f"{name} убран(а) из списка."
+        return "Такого друга не нашлось."
+
+    async def update_callback_message(event: MessageEvent, message: str) -> bool:
+        """Edit a callback message once, replacing it if VK rejects the edit."""
+        try:
+            _ = await event.edit_message(message=message, keyboard=inline_keyboard)
+        except VKAPIError:
+            _LOGGER.exception("Failed to edit callback message; sending replacement")
+            message_id = await bot.api.messages.send(
+                peer_id=config.chat_peer_id,
+                message=message,
+                keyboard=inline_keyboard,
+                random_id=secrets.randbits(31),
+            )
+            await storage.set_status_message_id(message_id)
+            return False
+        return True
+
+    async def refresh_canonical_status() -> None:
+        """Refresh the persisted registration status message when it is known."""
+        status_message_id = await storage.status_message_id()
+        if status_message_id is None:
+            return
+        entries = await storage.list_entries()
+        try:
+            _ = await bot.api.messages.edit(
+                peer_id=config.chat_peer_id,
+                message_id=status_message_id,
+                message=format_entries(entries),
+                keyboard=inline_keyboard,
+            )
+        except VKAPIError:
+            _LOGGER.exception("Failed to refresh canonical status message")
 
     def target_peer_only(
         handler: Callable[[_EventT], Awaitable[None]],
     ) -> Callable[[_EventT], Awaitable[None]]:
         @wraps(handler)
         async def guarded(event: _EventT) -> None:
-            if event.peer_id == config.chat_peer_id:
-                await handler(event)
+            if event.peer_id != config.chat_peer_id:
+                _LOGGER.info(
+                    "Ignored %s from unexpected peer_id=%s (configured %s)",
+                    type(event).__name__,
+                    event.peer_id,
+                    config.chat_peer_id,
+                )
+                return
+            _LOGGER.debug(
+                "Received %s from peer_id=%s",
+                type(event).__name__,
+                event.peer_id,
+            )
+            await handler(event)
 
         return guarded
 
-    @bot.on.message(text=["+", "записаться"])
+    @bot.on.message(text=["записаться"])
     @target_peer_only
     async def sign_up(msg: Message) -> None:
-        # Duplicates cb_join — keep in sync.
-        try:
-            _users = await bot.api.users.get(user_ids=[msg.from_id])
-        except VKAPIError:
-            _LOGGER.exception("VK API error fetching user %s", msg.from_id)
-            _ = await msg.answer(
-                "Не удалось получить данные из VK. Попробуй позже.",
-                keyboard=inline_keyboard,
-            )
-            return
-        name = (_users[0].first_name or "Unknown") if _users else "Unknown"
-        try:
-            if await storage.add_user(msg.from_id, name):
-                _ = await msg.answer("Ты записался!", keyboard=inline_keyboard)
-            else:
-                _ = await msg.answer("Ты уже в списке.", keyboard=inline_keyboard)
-        except ValueError as exc:
-            _ = await msg.answer(str(exc), keyboard=inline_keyboard)
+        # Shares join_user with cb_join.
+        response, _ = await join_user(msg.from_id)
+        _ = await msg.answer(
+            response,
+            keyboard=inline_keyboard,
+        )
+
+    @bot.on.message(text=["+"])
+    @bot.on.message(RegexRule(r"^\+\s+$"))
+    @target_peer_only
+    async def bare_plus(msg: Message) -> None:
+        _ = await msg.answer(
+            bare_plus_message,
+            keyboard=inline_keyboard,
+        )
 
     @bot.on.message(text=["-", "отписаться"])
     @target_peer_only
     async def sign_off(msg: Message) -> None:
-        # Duplicates cb_leave — keep in sync.
-        if await storage.remove_user(msg.from_id):
-            _ = await msg.answer("Ты отписался.", keyboard=inline_keyboard)
-        else:
-            _ = await msg.answer("Тебя не было в списке.", keyboard=inline_keyboard)
+        # Shares leave_user with cb_leave.
+        response, _ = await leave_user(msg.from_id)
+        _ = await msg.answer(
+            response,
+            keyboard=inline_keyboard,
+        )
 
     @bot.on.message(RegexRule(r"^\+\s*(.+)$"))
     @target_peer_only
@@ -88,31 +182,19 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
                 keyboard=inline_keyboard,
             )
             return
-        try:
-            await storage.add_friend(name)
-            _LOGGER.debug("Friend added: %s", name)
-            _ = await msg.answer(
-                f"{name} записан(а) как друг.",
-                keyboard=inline_keyboard,
-            )
-        except ValueError as exc:
-            _ = await msg.answer(str(exc), keyboard=inline_keyboard)
+        _ = await msg.answer(
+            await add_friend_by_name(name),
+            keyboard=inline_keyboard,
+        )
 
     @bot.on.message(RegexRule(r"^-\s*(.+)$"))
     @target_peer_only
     async def remove_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
-        if await storage.remove_friend(name):
-            _LOGGER.debug("Friend removed: %s", name)
-            _ = await msg.answer(
-                f"{name} убран(а) из списка.",
-                keyboard=inline_keyboard,
-            )
-        else:
-            _ = await msg.answer(
-                "Такого друга не нашлось.",
-                keyboard=inline_keyboard,
-            )
+        _ = await msg.answer(
+            await remove_friend_by_name(name),
+            keyboard=inline_keyboard,
+        )
 
     @bot.on.message(text=["список", "участники", "кто идёт"])
     @target_peer_only
@@ -139,23 +221,11 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_join(event: MessageEvent) -> None:
-        # Duplicates sign_up — keep in sync.
-        try:
-            _users = await bot.api.users.get(user_ids=[event.user_id])
-        except VKAPIError:
-            _LOGGER.exception("VK API error fetching user %s", event.user_id)
-            _ = await event.show_snackbar(
-                "Не удалось получить данные из VK. Попробуй позже."
-            )
-            return
-        name = (_users[0].first_name or "Unknown") if _users else "Unknown"
-        try:
-            if await storage.add_user(event.user_id, name):
-                _ = await event.show_snackbar("Ты записался!")
-            else:
-                _ = await event.show_snackbar("Ты уже в списке.")
-        except ValueError as exc:
-            _ = await event.show_snackbar(str(exc))
+        # Shares join_user with sign_up.
+        response, changed = await join_user(event.user_id)
+        if changed:
+            await refresh_canonical_status()
+        _ = await event.show_snackbar(response)
 
     @bot.on.raw_event(
         GroupEventType.MESSAGE_EVENT,
@@ -164,11 +234,11 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_leave(event: MessageEvent) -> None:
-        # Duplicates sign_off — keep in sync.
-        if await storage.remove_user(event.user_id):
-            _ = await event.show_snackbar("Ты отписался.")
-        else:
-            _ = await event.show_snackbar("Тебя не было в списке.")
+        # Shares leave_user with sign_off.
+        response, changed = await leave_user(event.user_id)
+        if changed:
+            await refresh_canonical_status()
+        _ = await event.show_snackbar(response)
 
     @bot.on.raw_event(
         GroupEventType.MESSAGE_EVENT,
@@ -179,10 +249,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def cb_list(event: MessageEvent) -> None:
         # Duplicates show_list — keep in sync.
         entries = await storage.list_entries()
-        _ = await event.send_message(
-            message=format_entries(entries),
-            keyboard=inline_keyboard,
-        )
+        if await update_callback_message(event, format_entries(entries)):
+            _ = await event.show_snackbar("Список обновлён в сообщении бота.")
 
     @bot.on.raw_event(
         GroupEventType.MESSAGE_EVENT,
@@ -191,10 +259,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_help(event: MessageEvent) -> None:
-        _ = await event.send_message(
-            message=help_text(compact=True),
-            keyboard=inline_keyboard,
-        )
+        if await update_callback_message(event, help_text(compact=True)):
+            _ = await event.show_snackbar("Справка обновлена.")
 
     # --- Admin handlers ---
 
