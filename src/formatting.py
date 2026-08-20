@@ -5,6 +5,16 @@ from typing import Final, assert_never
 from src.storage import Entry, FriendEntry, UserEntry
 
 _MAX_NAME_LENGTH: Final = 100
+_HELP_TEXT: Final = (
+    "Запись открывается после анонса сбора.\n"
+    "Для себя — «записаться» или кнопка «✅ Записаться».\n"
+    "Чтобы отписаться — «отписаться» или кнопка «↩️ Отписаться».\n"
+    "`+` без имени подскажет, как записаться, но не добавит вас.\n"
+    "+ Имя — записать друга, пока запись открыта.\n"
+    "- Имя — убрать друга.\n"
+    "📋 список — кто идёт.\n"
+    "❓ ? — помощь"
+)
 
 
 def format_entries(entries: list[Entry]) -> str:
@@ -25,23 +35,6 @@ def format_entries(entries: list[Entry]) -> str:
 
 
 def help_text(*, compact: bool = False) -> str:
-    """Return the message-command help text."""
-    if compact:
-        return (
-            "Команды:\n"
-            "➕ — записаться\n"
-            "➖ — отписаться\n"
-            "+ Имя — записать друга\n"
-            "- Имя — убрать друга\n"
-            "📋 — список\n"
-            "❓ — помощь"
-        )
-    return (
-        "Команды:\n"
-        "➕ или записаться — записаться\n"
-        "➖ или отписаться — отписаться\n"
-        "+ Имя — записать друга\n"
-        "- Имя — убрать друга\n"
-        "📋 список — кто идёт\n"
-        "❓ ? — помощь"
-    )
+    """Return lifecycle-aware help for text and callback messages."""
+    _ = compact
+    return _HELP_TEXT

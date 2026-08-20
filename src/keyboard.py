@@ -8,12 +8,12 @@ def build_inline_keyboard() -> str:
     return (
         Keyboard(one_time=False, inline=True)
         .add(
-            Callback("➕", payload={"cmd": "join"}),
-            color=KeyboardButtonColor.POSITIVE,
+            Callback("✅ Записаться", payload={"cmd": "join"}),
+            color=KeyboardButtonColor.SECONDARY,
         )
         .add(
-            Callback("➖", payload={"cmd": "leave"}),
-            color=KeyboardButtonColor.NEGATIVE,
+            Callback("↩️ Отписаться", payload={"cmd": "leave"}),
+            color=KeyboardButtonColor.SECONDARY,
         )
         .row()
         .add(Callback("📋 Список", payload={"cmd": "list"}))

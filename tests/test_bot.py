@@ -58,14 +58,19 @@ def test_help_text_when_requested() -> None:
     # When: the help presentation is built.
     text = help_text()
 
-    # Then: it contains every documented command family.
-    assert text
-    assert "записаться" in text
-    assert "отписаться" in text
+    # Then: it gives lifecycle-aware guidance without treating bare + as signup.
+    signup_line = next(line for line in text.splitlines() if "Для себя" in line)
+    assert "+" not in signup_line
+    assert "записаться" in signup_line
+    assert "после анонса" in text
     assert "+ Имя" in text
+    assert "пока запись открыта" in text
+    assert "не добавит вас" in text
+    assert "отписаться" in text
     assert "- Имя" in text
     assert "список" in text
     assert "помощь" in text
+    assert help_text(compact=True) == text
 
 
 @pytest.mark.parametrize(
@@ -92,10 +97,23 @@ def test_extract_friend_name_when_command_contains_sign(
 def test_build_inline_keyboard_when_serialized() -> None:
     # Given: no external dependencies.
     # When: the inline keyboard is built.
-    keyboard = build_inline_keyboard()
+    keyboard = json.loads(build_inline_keyboard())
 
-    # Then: VK can consume it as JSON.
-    assert isinstance(json.loads(keyboard), dict)
+    # Then: VK receives readable labels, stable commands, and neutral join controls.
+    buttons = [button for row in keyboard["buttons"] for button in row]
+    actions = [button["action"] for button in buttons]
+    assert [(action["label"], action["payload"]["cmd"]) for action in actions] == [
+        ("✅ Записаться", "join"),
+        ("↩️ Отписаться", "leave"),
+        ("📋 Список", "list"),
+        ("❓ Помощь", "help"),
+    ]
+    assert [button.get("color") for button in buttons] == [
+        "secondary",
+        "secondary",
+        None,
+        None,
+    ]
 
 
 def test_admin_help_text_contains_commands() -> None:
