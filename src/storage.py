@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Annotated, ClassVar, Final, Literal
+from typing import Annotated, ClassVar, Final, Literal, assert_never
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -37,6 +37,8 @@ Entry = UserEntry | FriendEntry
 class _StorageData(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
     participants: tuple[Annotated[Entry, Field(discriminator="kind")], ...]
+    registration_state: Literal["closed", "opening", "open"] = "closed"
+    status_message_id: int | None = None
 
 
 class Storage:
@@ -46,17 +48,28 @@ class Storage:
         """Load existing data or start empty."""
         self._path: Path = path
         self._entries: list[Entry] = []
+        self._registration_state: Literal["closed", "opening", "open"] = "closed"
+        self._status_message_id: int | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._load()
 
     def _load(self) -> None:
         if not self._path.exists():
+            _LOGGER.info("No data file at %s, starting with empty list", self._path)
             return
         data = _StorageData.model_validate_json(self._path.read_bytes())
         self._entries = list(data.participants)
+        match data.registration_state:
+            case "opening":
+                self._registration_state = "closed"
+            case "closed" | "open":
+                self._registration_state = data.registration_state
+            case unreachable:  # type: ignore[reportUnnecessaryComparison]
+                assert_never(unreachable)
+        self._status_message_id = data.status_message_id
+        _LOGGER.info("Loaded %d entries from %s", len(self._entries), self._path)
 
-    async def _save(self, entries: list[Entry]) -> None:
-        data = _StorageData(participants=tuple(entries))
+    async def _save(self, data: _StorageData) -> None:
         temp_path = self._path.with_suffix(".tmp")
 
         def _write() -> None:
@@ -68,10 +81,22 @@ class Storage:
         except OSError:
             _LOGGER.exception("Failed to persist storage to %s", self._path)
             raise
+        _LOGGER.debug("Saved %d entries to %s", len(data.participants), self._path)
 
-    async def _commit(self, entries: list[Entry]) -> None:
-        await self._save(entries)
-        self._entries = entries
+    async def _commit(self, data: _StorageData) -> None:
+        await self._save(data)
+        self._entries = list(data.participants)
+        self._registration_state = data.registration_state
+        self._status_message_id = data.status_message_id
+
+    async def _commit_entries(self, entries: list[Entry]) -> None:
+        await self._commit(
+            _StorageData(
+                participants=tuple(entries),
+                registration_state=self._registration_state,
+                status_message_id=self._status_message_id,
+            )
+        )
 
     async def add_user(self, vk_id: int, name: str) -> bool:
         """Add a VK user if not already present. Returns True if added."""
@@ -86,7 +111,7 @@ class Storage:
                 *self._entries,
                 UserEntry(kind="user", vk_id=vk_id, name=name),
             ]
-            await self._commit(entries)
+            await self._commit_entries(entries)
             return True
 
     async def remove_user(self, vk_id: int) -> bool:
@@ -96,7 +121,7 @@ class Storage:
                 if e.kind == "user" and e.vk_id == vk_id:
                     entries = self._entries.copy()
                     _ = entries.pop(i)
-                    await self._commit(entries)
+                    await self._commit_entries(entries)
                     return True
             return False
 
@@ -108,7 +133,7 @@ class Storage:
             if len(self._entries) >= _MAX_ENTRIES:
                 raise ValueError(_LIMIT_REACHED_MSG)
             entries = [*self._entries, FriendEntry(kind="friend", name=name)]
-            await self._commit(entries)
+            await self._commit_entries(entries)
 
     async def remove_friend(self, name: str) -> bool:
         """Remove a friend by exact name. Returns True if removed."""
@@ -117,7 +142,7 @@ class Storage:
                 if e.kind == "friend" and e.name == name:
                     entries = self._entries.copy()
                     _ = entries.pop(i)
-                    await self._commit(entries)
+                    await self._commit_entries(entries)
                     return True
             return False
 
@@ -126,6 +151,54 @@ class Storage:
         async with self._lock:
             return list(self._entries)
 
+    async def registration_state(self) -> Literal["closed", "opening", "open"]:
+        """Return the current registration lifecycle state."""
+        async with self._lock:
+            return self._registration_state
+
+    async def status_message_id(self) -> int | None:
+        """Return the current registration status message identifier."""
+        async with self._lock:
+            return self._status_message_id
+
+    async def mark_opening(self) -> None:
+        """Persist that a new collection is being prepared."""
+        async with self._lock:
+            await self._commit(
+                _StorageData(
+                    participants=tuple(self._entries),
+                    registration_state="opening",
+                    status_message_id=self._status_message_id,
+                )
+            )
+
+    async def start_new_collection(self, status_message_id: int | None) -> None:
+        """Atomically clear participants and open a new collection."""
+        async with self._lock:
+            await self._commit(
+                _StorageData(
+                    participants=(),
+                    registration_state="open",
+                    status_message_id=status_message_id,
+                )
+            )
+
+    async def set_status_message_id(self, message_id: int | None) -> None:
+        """Persist the message identifier for the current registration status."""
+        async with self._lock:
+            await self._commit(
+                _StorageData(
+                    participants=tuple(self._entries),
+                    registration_state=self._registration_state,
+                    status_message_id=message_id,
+                )
+            )
+
+    async def is_registration_open(self) -> bool:
+        """Return whether the current collection accepts registrations."""
+        async with self._lock:
+            return self._registration_state == "open"
+
     async def remove_by_name(self, name: str) -> bool:
         """Remove the first entry matching *name* (user or friend)."""
         async with self._lock:
@@ -133,11 +206,11 @@ class Storage:
                 if e.name == name:
                     entries = self._entries.copy()
                     _ = entries.pop(i)
-                    await self._commit(entries)
+                    await self._commit_entries(entries)
                     return True
             return False
 
     async def clear(self) -> None:
         """Clear all entries and persist."""
         async with self._lock:
-            await self._commit([])
+            await self._commit_entries([])

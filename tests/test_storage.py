@@ -41,6 +41,112 @@ async def test_storage_round_trip_when_entries_are_added(tmp_path: Path) -> None
 
 
 @pytest.mark.anyio
+async def test_storage_loads_legacy_participants_as_closed(tmp_path: Path) -> None:
+    """Given legacy JSON, loading supplies closed lifecycle defaults."""
+    # Given
+    path = tmp_path / "participants.json"
+    path.write_text(
+        '{"participants": [{"kind": "user", "vk_id": 1, "name": "Alice"}]}',
+        encoding="utf-8",
+    )
+
+    # When
+    storage = Storage(path)
+
+    # Then
+    assert await storage.registration_state() == "closed"
+    assert await storage.status_message_id() is None
+    assert [entry.name for entry in await storage.list_entries()] == ["Alice"]
+
+
+@pytest.mark.anyio
+async def test_storage_recovers_opening_state_as_closed(tmp_path: Path) -> None:
+    """Given an interrupted opening, loading closes it without clearing entries."""
+    # Given
+    path = tmp_path / "participants.json"
+    path.write_text(
+        """{
+  "participants": [{"kind": "friend", "name": "Bob"}],
+  "registration_state": "opening",
+  "status_message_id": null
+}""",
+        encoding="utf-8",
+    )
+
+    # When
+    storage = Storage(path)
+
+    # Then
+    assert await storage.registration_state() == "closed"
+    assert await storage.is_registration_open() is False
+    assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
+
+
+@pytest.mark.anyio
+async def test_storage_starts_new_collection_as_open(tmp_path: Path) -> None:
+    """Given prior entries, starting a collection atomically clears and opens it."""
+    # Given
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.add_friend("Bob")
+    await storage.mark_opening()
+
+    # When
+    await storage.start_new_collection(123)
+
+    # Then
+    assert await storage.list_entries() == []
+    assert await storage.registration_state() == "open"
+    assert await storage.is_registration_open() is True
+    assert await storage.status_message_id() == 123
+
+
+@pytest.mark.anyio
+async def test_storage_persists_status_message_id(tmp_path: Path) -> None:
+    """Given a status message update, reloading returns the saved identifier."""
+    # Given
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+
+    # When
+    await storage.set_status_message_id(456)
+
+    # Then
+    assert await Storage(path).status_message_id() == 456
+
+
+@pytest.mark.anyio
+async def test_storage_preserves_lifecycle_when_start_collection_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given a failed collection start, live and saved state remain unchanged."""
+    # Given
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.add_friend("Bob")
+    original = path.read_text(encoding="utf-8")
+
+    def fail_replace(self: Path, _target: Path) -> Path:
+        message = "cannot replace"
+        raise OSError(message)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    # When / Then
+    with pytest.raises(OSError, match="cannot replace"):
+        await storage.start_new_collection(123)
+
+    assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
+    assert await storage.registration_state() == "closed"
+    assert await storage.status_message_id() is None
+    assert path.read_text(encoding="utf-8") == original
+    persisted = Storage(path)
+    assert [entry.name for entry in await persisted.list_entries()] == ["Bob"]
+    assert await persisted.registration_state() == "closed"
+
+
+@pytest.mark.anyio
 async def test_storage_preserves_original_when_atomic_replace_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
