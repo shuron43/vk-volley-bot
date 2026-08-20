@@ -123,19 +123,28 @@ def test_pick_next_event_selects_nearer_target(
 
 
 @pytest.mark.anyio
-async def test_send_announcement_sends_configured_message(config: Config) -> None:
-    # Given: an API whose message endpoint succeeds
+@pytest.mark.parametrize(
+    ("response", "expected_message_id"),
+    [(123, 123), (None, None), ("unexpected", None)],
+)
+async def test_send_announcement_returns_message_id_when_available(
+    config: Config,
+    response: int | str | None,
+    expected_message_id: int | None,
+) -> None:
+    # Given: an API whose message endpoint returns a message ID or mock value
     api = MagicMock()
-    api.messages.send = AsyncMock(return_value=1)
+    api.messages.send = AsyncMock(return_value=response)
 
     # When: the scheduler sends an announcement
-    await scheduler._send_announcement(api, config, "keyboard")
+    message_id = await scheduler._send_announcement(api, config, "keyboard")
 
-    # Then: it targets the configured chat with the supplied keyboard
+    # Then: it targets the configured chat and retains only valid message IDs
     sent = api.messages.send.await_args.kwargs
     assert sent["peer_id"] == config.chat_peer_id
     assert sent["keyboard"] == "keyboard"
     assert sent["message"].startswith("🏐 Сбор на волейбол!")
+    assert message_id == expected_message_id
 
 
 @pytest.mark.anyio
@@ -164,7 +173,42 @@ async def test_send_reminder_shows_current_list(
 
 
 @pytest.mark.anyio
-async def test_scheduler_retries_announcement_after_failure(
+async def test_scheduler_opens_collection_after_successful_announcement(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Given: a previous collection and a successful announcement delivery
+    api = MagicMock()
+    api.messages.send = AsyncMock(return_value=123)
+    storage = Storage(tmp_path / "participants.json")
+    await storage.add_user(vk_id=1, name="Alice")
+    sleep_durations: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_durations.append(seconds)
+        if len(sleep_durations) == 2:
+            raise StopSchedulerError
+
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
+    )
+    monkeypatch.setattr(scheduler.anyio, "sleep", fake_sleep)
+
+    # When: the scheduler reaches the collection target
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(api, config, storage)
+
+    # Then: it clears the previous collection and opens the new one with its ID
+    assert await storage.list_entries() == []
+    assert await storage.registration_state() == "open"
+    assert await storage.status_message_id() == 123
+
+
+@pytest.mark.anyio
+async def test_scheduler_preserves_participants_while_announcement_is_retried(
     caplog: pytest.LogCaptureFixture,
     config: Config,
     monkeypatch: pytest.MonkeyPatch,
@@ -172,8 +216,25 @@ async def test_scheduler_retries_announcement_after_failure(
 ) -> None:
     # Given: the first API delivery fails and the next one succeeds
     api = MagicMock()
-    api.messages.send = AsyncMock(side_effect=[OSError("VK unavailable"), 1])
     storage = Storage(tmp_path / "participants.json")
+    await storage.add_user(vk_id=1, name="Alice")
+    failed_attempt_participants: list[str] = []
+    failed_attempt_states: list[str] = []
+    attempts = 0
+
+    async def send_message(**_kwargs: int | str) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            failed_attempt_participants.extend(
+                entry.name for entry in await storage.list_entries()
+            )
+            failed_attempt_states.append(await storage.registration_state())
+            error = OSError("VK unavailable")
+            raise error
+        return 456
+
+    api.messages.send = AsyncMock(side_effect=send_message)
     sleep_durations: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -192,14 +253,19 @@ async def test_scheduler_retries_announcement_after_failure(
     with pytest.raises(StopSchedulerError):
         await scheduler.run_scheduler(api, config, storage)
 
-    # Then: it logs the failure, waits five minutes, and retries the delivery
+    # Then: it preserves the prior collection while opening is retried
     assert api.messages.send.await_count == 2
     assert sleep_durations == [3600.0, 300.0, 3600.0]
     assert "Weekly announcement failed; retrying in five minutes" in caplog.text
+    assert failed_attempt_participants == ["Alice"]
+    assert failed_attempt_states == ["opening"]
+    assert await storage.list_entries() == []
+    assert await storage.registration_state() == "open"
+    assert await storage.status_message_id() == 456
 
 
 @pytest.mark.anyio
-async def test_scheduler_clears_once_when_announcement_send_is_retried(
+async def test_scheduler_starts_new_collection_once_when_announcement_is_retried(
     config: Config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -207,6 +273,8 @@ async def test_scheduler_clears_once_when_announcement_send_is_retried(
     api = MagicMock()
     api.messages.send = AsyncMock(side_effect=[OSError("VK unavailable"), 1])
     storage = MagicMock(spec=Storage)
+    storage.mark_opening = AsyncMock()
+    storage.start_new_collection = AsyncMock()
     storage.clear = AsyncMock()
     sleep_durations: list[float] = []
 
@@ -226,5 +294,7 @@ async def test_scheduler_clears_once_when_announcement_send_is_retried(
     with pytest.raises(StopSchedulerError):
         await scheduler.run_scheduler(api, config, storage)
 
-    # Then: participant state is cleared only once for that collection event
-    storage.clear.assert_awaited_once_with()
+    # Then: the opening transition is attempted once and collection starts once
+    storage.mark_opening.assert_awaited_once_with()
+    storage.start_new_collection.assert_awaited_once_with(1)
+    storage.clear.assert_not_awaited()

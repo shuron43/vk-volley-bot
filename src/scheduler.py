@@ -19,7 +19,7 @@ from src.storage import Storage
 _RETRY_DELAY_SECONDS: Final = 5 * 60
 _ANNOUNCEMENT_MESSAGE: Final = (
     "🏐 Сбор на волейбол!\n"
-    "Кто идёт? Напиши + или имя друга через +\n"
+    "Кто идёт? Напиши «записаться» или имя друга через +\n"
     "список — посмотреть участников"
 )
 _LOGGER: Final = logging.getLogger(__name__)
@@ -36,14 +36,17 @@ def _next_target(
     return target + datetime.timedelta(days=days_ahead)
 
 
-async def _send_announcement(api: API, config: Config, inline_keyboard: str) -> None:
+async def _send_announcement(
+    api: API, config: Config, inline_keyboard: str
+) -> int | None:
     """Send the weekly collection announcement to the configured chat."""
-    _ = await api.messages.send(
+    message_id = await api.messages.send(
         peer_id=config.chat_peer_id,
         message=_ANNOUNCEMENT_MESSAGE,
         keyboard=inline_keyboard,
         random_id=secrets.randbelow(2_147_483_647),
     )
+    return message_id if type(message_id) is int else None
 
 
 async def _send_reminder(
@@ -73,15 +76,14 @@ def _pick_next_event(
     return remind_target, "remind"
 
 
-async def _run_with_retry(
+async def _run_with_retry[T](
     label: str,
-    operation: Callable[[], Awaitable[None]],
-) -> None:
+    operation: Callable[[], Awaitable[T]],
+) -> T:
     """Run an operation with the scheduler's standard retry loop."""
     while True:
         try:
-            await operation()
-            _LOGGER.info("%s sent successfully", label)
+            result = await operation()
         except anyio.get_cancelled_exc_class():
             raise
         except (OSError, TimeoutError, VKAPIError):
@@ -91,7 +93,8 @@ async def _run_with_retry(
             )
             await anyio.sleep(_RETRY_DELAY_SECONDS)
         else:
-            break
+            _LOGGER.info("%s sent successfully", label)
+            return result
 
 
 async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
@@ -101,6 +104,14 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
     minute = config.collect_minute
 
     inline_keyboard = build_inline_keyboard()
+
+    _LOGGER.info(
+        "Scheduler started: collect weekday=%d time=%02d:%02d, remind_enabled=%s",
+        weekday,
+        hour,
+        minute,
+        config.remind_enabled,
+    )
 
     while True:
         now = datetime.datetime.now()  # noqa: DTZ005
@@ -127,11 +138,14 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
         await anyio.sleep(sleep_seconds)
 
         if event == "collect":
-            await storage.clear()
-            await _run_with_retry(
+            await storage.mark_opening()
+            _LOGGER.info("Participant list marked opening for new collection")
+            message_id = await _run_with_retry(
                 "Weekly announcement",
                 partial(_send_announcement, api, config, inline_keyboard),
             )
+            await storage.start_new_collection(message_id)
+            _LOGGER.info("Participant list cleared and opened for new collection")
         else:
             await _run_with_retry(
                 "Weekly reminder",
