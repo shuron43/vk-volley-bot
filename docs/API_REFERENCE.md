@@ -69,7 +69,7 @@ ID. `_validate_schedule_collision` запрещает включённому н�
 
 ## `src/storage.py`
 
-JSON-хранилище участников. Безопасен в рамках одного event loop: все публичные методы асинхронны и защищены `asyncio.Lock`.
+JSON-хранилище участников и состояния регистрации. Безопасен в рамках одного event loop: все публичные методы асинхронны и защищены `asyncio.Lock`.
 
 ### `UserEntry(BaseModel)`
 
@@ -94,24 +94,37 @@ JSON-хранилище участников. Безопасен в рамках
 
 Тип-объединение: `UserEntry | FriendEntry`.
 
+### `_StorageData(BaseModel)`
+
+Внутренняя Pydantic-модель, описывающая содержимое JSON-файла.
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `participants` | `tuple[Annotated[Entry, Field(discriminator="kind")], ...]` | Участники текущего сбора |
+| `registration_state` | `Literal["closed", "opening", "open"]` | Состояние жизненного цикла регистрации (см. `bot-user-journey-fixes` план, шаг 1) |
+| `status_message_id` | `int \| None` | ID канонического статусного сообщения бота (используется callback-хендлерами для `messages.edit`) |
+
 ### `Storage`
 
 #### `__init__(self, path: Path) -> None`
 
-Загружает существующий JSON или начинает с пустым списком.
+Загружает существующий JSON или начинает с пустым списком и состоянием `closed`.
 
 #### `_load(self) -> None`
 
-Приватный. Десериализует JSON из `self._path` через `_StorageData.model_validate_json()`.
+Приватный. Десериализует JSON из `self._path` через `_StorageData.model_validate_json()`. Состояние `opening` безопасно нормализуется в `closed` (участники сохраняются).
 
-#### `_save(self, entries: list[Entry]) -> None`
+#### `_save(self, data: _StorageData) -> None`
 
-Приватный. Сериализует список-кандидат в JSON, пишет во временный файл и атомарно перемещает через `replace()`.
+Приватный. Сериализует снимок в JSON, пишет во временный файл и атомарно перемещает через `replace()`.
 
-#### `_commit(self, entries: list[Entry]) -> None`
+#### `_commit(self, data: _StorageData) -> None`
 
-Сначала сохраняет кандидат, затем заменяет `_entries`. При ошибке записи живое
-и дисковое состояния остаются прежними.
+Сначала сохраняет снимок, затем заменяет `_entries`, `_registration_state` и `_status_message_id`. При ошибке записи живое и дисковое состояния остаются прежними.
+
+#### `_commit_entries(self, entries: list[Entry]) -> None`
+
+Снимок только участников; состояние регистрации и `status_message_id` сохраняются.
 
 #### `async add_user(self, vk_id: int, name: str) -> bool`
 
@@ -127,7 +140,7 @@ JSON-хранилище участников. Безопасен в рамках
 
 #### `async add_friend(self, name: str) -> None`
 
-Добавляет `FriendEntry`. Дубликаты разрешены.
+Добавляет `FriendEntry`. Дубликаты разрешены. **Гейтится хелпером** `add_friend_by_name` в `bot.py` через `is_registration_open()`; сам метод `add_friend` эту проверку не выполняет.
 
 **Сложность:** O(1) амортизированно.
 
@@ -143,6 +156,30 @@ JSON-хранилище участников. Безопасен в рамках
 
 **Сложность:** O(n).
 
+#### `async registration_state(self) -> Literal["closed", "opening", "open"]`
+
+Текущее состояние жизненного цикла регистрации. Используется хелперами ботa, не вызывается из пользовательских команд напрямую.
+
+#### `async status_message_id(self) -> int | None`
+
+ID канонического статусного сообщения бота, в котором callback-кнопки редактируют список. `None`, если сообщение ещё не было отправлено или потеряно.
+
+#### `async is_registration_open(self) -> bool`
+
+`True`, если `registration_state == "open"`. Это единственная проверка для всех попыток добавления участника.
+
+#### `async mark_opening(self) -> None`
+
+Переводит регистрацию в состояние `opening`, **сохраняя** текущий список и `status_message_id`. Вызывается планировщиком ровно один раз перед попыткой отправки анонса. Если VK API упадёт, состояние останется `opening` до перезапуска (см. `_load`) или до успешной отправки.
+
+#### `async start_new_collection(self, status_message_id: int | None) -> None`
+
+Атомарно очищает `participants`, переводит регистрацию в `open` и сохраняет новый `status_message_id`. Вызывается планировщиком сразу после успешной отправки анонса.
+
+#### `async set_status_message_id(self, message_id: int | None) -> None`
+
+Сохраняет ID заменяющего сообщения, отправленного при неудачном редактировании callback-кнопки. Не меняет ни участников, ни состояние регистрации.
+
 #### `async remove_by_name(self, name: str) -> bool`
 
 Удаляет первую запись с точным совпадением `name` (UserEntry или FriendEntry). Возвращает `True` если удалён.
@@ -151,7 +188,7 @@ JSON-хранилище участников. Безопасен в рамках
 
 #### `async clear(self) -> None`
 
-Очищает список и перезаписывает файл JSON с пустым массивом `{"participants": []}`.
+Очищает список и перезаписывает файл JSON с пустым массивом участников. Состояние регистрации и `status_message_id` сохраняются. Используется только админ-командой `очистить`/`сбросить`; **не вызывается планировщиком** — за это отвечает `start_new_collection()`.
 
 ---
 
@@ -171,37 +208,63 @@ JSON-хранилище участников. Безопасен в рамках
 
 Хендлеры сообщений vkbottle. Все хендлеры асинхронные (`async def`).
 
-### `build_inline_keyboard() -> str`
-
-Собирает inline-клавиатуру с кнопками `+`, `-`, `Список`, `Помощь` и возвращает её JSON.
-
 ### `extract_friend_name(text: str) -> str`
 
-Извлекает и обрезает имя друга после символа `+` или `-`.
+Извлекает и обрезает имя друга после символа `+` или `-` (`text[1:].strip()`).
+
+### Внутренние помощники (замыкания в `setup_handlers`)
+
+Хелперы `join_user`, `leave_user`, `add_friend_by_name`, `remove_friend_by_name`
+разделяются между текстовыми командами и callback-кнопками, чтобы поведение
+не разъезжалось между каналами:
+
+| Хелпер | Сигнатура | Что делает |
+|--------|-----------|-----------|
+| `join_user(vk_id)` | `async -> tuple[str, bool]` | Проверяет `is_registration_open()`, тянет имя через VK API, добавляет `UserEntry`. Возвращает `(ответ, изменился_ли_список)` |
+| `leave_user(vk_id)` | `async -> tuple[str, bool]` | Удаляет `UserEntry` по `vk_id`, без проверки состояния |
+| `add_friend_by_name(name)` | `async -> str` | Проверяет `is_registration_open()`, добавляет `FriendEntry` |
+| `remove_friend_by_name(name)` | `async -> str` | Удаляет первого друга с точным именем, без проверки состояния |
+| `update_callback_message(event, message)` | `async -> bool` | Пытается `event.edit_message(...)`; при `VKAPIError` отправляет ровно одну замену через `bot.api.messages.send(...)` с `random_id=secrets.randbits(31)` и сохраняет её ID как новый канонический статус |
+| `refresh_canonical_status()` | `async -> None` | Если `storage.status_message_id()` известен — `bot.api.messages.edit(...)` со свежим `format_entries(...)`. Используется после успешного `cb_join`/`cb_leave` |
 
 ### `setup_handlers(bot: Bot, storage: Storage, config: Config) -> None`
 
-Регистрирует 9 текстовых и 4 callback-хендлера. Общий wrapper допускает тело
-каждого handler только при `event.peer_id == config.chat_peer_id`.
+Регистрирует 9 текстовых и 4 callback-хендлера. Общий wrapper `target_peer_only`
+допускает тело каждого handler только при `event.peer_id == config.chat_peer_id`.
 
-#### Хендлер `+` / `записаться`
+#### Хендлер `записаться`
 
-**Правило:** `@bot.on.message(text=["+", "записаться"])`
+**Правило:** `@bot.on.message(text=["записаться"])`
 
-1. Вызывает `bot.api.users.get(user_ids=[msg.from_id])` для получения имени.
-2. Вызывает `storage.add_user(vk_id, name)`.
-3. Отвечает:
-   - `"Ты записался!"` — при успехе
-   - `"Ты уже в списке."` — если дубликат
+1. Вызывает `join_user(msg.from_id)` (см. таблицу выше).
+2. Отправляет ответ через `msg.answer(..., keyboard=inline_keyboard)`.
 
-**Особенность:** зависит от VK API для резолва имени. Если VK API вернёт пустой список пользователей или `first_name` отсутствует — используется `"Unknown"`. `VKAPIError` перехватывается, пользователю отправляется сообщение о временной ошибке.
+**Особенность:** зависит от VK API для резолва имени. Если VK API вернёт пустой список пользователей или `first_name` отсутствует — используется `"Unknown"`. `VKAPIError` перехватывается, пользователю отправляется сообщение о временной ошибке. При закрытой регистрации возвращается `Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь».`.
+
+#### Хендлер `+` (bare_plus, guidance-only)
+
+**Правила:**
+```
+@bot.on.message(text=["+"])
+@bot.on.message(RegexRule(r"^\+\s+$"))
+```
+
+Регистрируется **до** `add_friend` (RegexRule `^\+\s*(.+)$`), чтобы `+` (с пробелами или без) не доходил до логики записи друга.
+
+Что происходит: возвращает подсказку
+
+```
+Чтобы записаться, нажми «Записаться» или напиши «записаться» после анонса. Для друга: + Имя.
+```
+
+Никаких вызовов `bot.api.users.get`, никаких мутаций хранилища — в любом состоянии жизненного цикла.
 
 #### Хендлер `-` / `отписаться`
 
 **Правило:** `@bot.on.message(text=["-", "отписаться"])`
 
-1. Вызывает `storage.remove_user(msg.from_id)`.
-2. Отвечает:
+1. Вызывает `leave_user(msg.from_id)`.
+2. Отвечает через `msg.answer(...)` одним из:
    - `"Ты отписался."` — при успехе
    - `"Тебя не было в списке."` — если не найден
 
@@ -210,18 +273,18 @@ JSON-хранилище участников. Безопасен в рамках
 **Правило:** `@bot.on.message(RegexRule(r"^\+\s*(.+)$"))`
 
 1. Извлекает текст после `+` через `extract_friend_name()`.
-2. Если имя пустое — отвечает `"Укажи имя друга: + Имя"`.
-3. Вызывает `storage.add_friend(name)`.
-4. Отвечает `"{name} записан(а) как друг."`.
+2. Если имя пустое — отвечает `"Укажи имя друга: + Имя"` (эта ветка уже не достигается, если сработал `bare_plus`).
+3. Вызывает `add_friend_by_name(name)` — внутри проверяется `is_registration_open()`. Если закрыто — `Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь».`.
+4. Иначе — `"{name} записан(а) как друг."`.
 
-**Особенность:** регистронезависимость зависит от ввода пользователя. Фильтрация пробелов — ручная.
+**Особенность:** регистр сохраняется как ввёл пользователь. Фильтрация пробелов ручная.
 
 #### Хендлер `- Имя`
 
 **Правило:** `@bot.on.message(RegexRule(r"^-\s*(.+)$"))`
 
 1. Извлекает текст после `-`.
-2. Вызывает `storage.remove_friend(name)`.
+2. Вызывает `remove_friend_by_name(name)`.
 3. Отвечает:
    - `"{name} убран(а) из списка."` — при успехе
    - `"Такого друга не нашлось."` — если не найден
@@ -232,61 +295,72 @@ JSON-хранилище участников. Безопасен в рамках
 
 1. Получает `entries = storage.list_entries()`.
 2. Если пусто — отвечает `"Пока никто не записался."`.
-3. Иначе формирует нумерованный список:
-   - `UserEntry`: `"{i}. {name}"`
-   - `FriendEntry`: `"{i}. {name} (друг)"`
-4. Использует `match/case` с `assert_never` для exhaustive matching.
+3. Иначе формирует нумерованный список через `format_entries(entries)` (нумерация начинается с 1; `FriendEntry` помечается `(друг)`).
+4. `format_entries` использует `match/case` с `assert_never` для exhaustive matching.
 
 #### Хендлер `?` / `help` / `помощь` / `команды`
 
 **Правило:** `@bot.on.message(text=["?", "help", "помощь", "команды"])`
 
-Отправляет список команд с пояснениями и inline-клавиатурой.
+Отправляет `help_text()` — единый текст справки, общий с кнопкой **❓ Помощь**. Внутри:
+- объясняется жизненный цикл (запись открывается после анонса);
+- явно сказано, что `+` без имени — подсказка, а не запись;
+- `+ Имя` помечено как доступное только пока запись открыта.
 
 ### Inline-клавиатура
 
-Создаётся один раз в `setup_handlers` и прикрепляется ко всем ответам бота:
+Создаётся **один раз** в `setup_handlers` и прикрепляется ко всем ответам бота
+(см. `src/keyboard.py`):
 
 ```
-➕ (join)    ➖ (leave)
-📋 Список   ❓ Помощь
+✅ Записаться   ↩️ Отписаться
+📋 Список      ❓ Помощь
 ```
 
 **Конструктор:** `Keyboard(one_time=False, inline=True)`
 - `Callback(label, payload={"cmd": "..."})` — callback-кнопка
-- `KeyboardButtonColor.POSITIVE` / `NEGATIVE` — цвет для `+` и `-`
+- `KeyboardButtonColor.SECONDARY` — нейтральный цвет для **✅ Записаться** и **↩️ Отписаться** (визуально не выделяют «хорошие» и «плохие» действия)
+
+`payload` остаются прежними (`join`, `leave`, `list`, `help`), чтобы не ломать существующие кнопки в диалоге — поменялись только подписи.
 
 ### Callback-хендлеры
 
-Обрабатывают нажатия inline-кнопок через `GroupEventType.MESSAGE_EVENT`.
+Обрабатывают нажатия inline-кнопок через `GroupEventType.MESSAGE_EVENT`. Все четыре хелпера `target_peer_only`-обёрнуты.
 
 #### `cb_join` — `PayloadRule({"cmd": "join"})`
 
-Логика идентична `sign_up`, но:
-- `vk_id` берётся из `event.user_id`
-- Обратная связь через `event.show_snackbar(...)`
+Шарит `join_user` с `sign_up`:
+1. `response, changed = await join_user(event.user_id)`
+2. Если `changed` — обновляет канонический статус через `refresh_canonical_status()`
+3. Показывает snackbar: `_ = await event.show_snackbar(response)`
 
 #### `cb_leave` — `PayloadRule({"cmd": "leave"})`
 
-Логика идентична `sign_off`:
-- `storage.remove_user(event.user_id)`
-- `event.show_snackbar(...)`
+Шарит `leave_user` с `sign_off`:
+1. `response, changed = await leave_user(event.user_id)`
+2. Если `changed` — обновляет канонический статус
+3. Snackbar с ответом
 
 #### `cb_list` — `PayloadRule({"cmd": "list"})`
 
-Логика идентична `show_list`:
-- Результат отправляется через `event.send_message(message=..., keyboard=inline_keyboard)`
+Шарит форматирование с `show_list`:
+1. `entries = storage.list_entries()`
+2. `ok = await update_callback_message(event, format_entries(entries))`
+3. При успехе — snackbar `"Список обновлён в сообщении бота."`
+
+`update_callback_message` сначала пробует `event.edit_message(...)`; при `VKAPIError` ровно один раз отправляет `bot.api.messages.send(...)` с криптографически случайным `random_id` и сохраняет возвращённый ID через `storage.set_status_message_id(message_id)`.
 
 #### `cb_help` — `PayloadRule({"cmd": "help"})`
 
-Логика идентична `help_cmd`:
-- `event.send_message(message=..., keyboard=inline_keyboard)`
+Шарит текст с `help_cmd`:
+1. `ok = await update_callback_message(event, help_text(compact=True))`
+2. При успехе — snackbar `"Справка обновлена."`
 
-> **Важно:** VK callback-кнопки не отправляют текстовое сообщение в чат. Они генерируют событие `message_event`, которое ловится через `raw_event`. Обработка происходит «тихо» — пользователь видит только снэкбар или новое сообщение от бота.
+> **Важно:** VK callback-кнопки не отправляют текстовое сообщение в чат. Они генерируют событие `message_event`, которое ловится через `raw_event`. При успешном редактировании пользователь видит только snackbar; чат остаётся без новых сообщений. Если VK отклонил редактирование — чат получает ровно одну замену, и её ID становится каноническим статусом для будущих обновлений.
 
 ### Админ-хендлеры
 
-Требуют `config.is_admin(msg.from_id) == True`. Доступны только пользователям из `ADMIN_VK_IDS_RAW`.
+Требуют `config.is_admin(msg.from_id) == True`. Доступны только пользователям из `ADMIN_VK_IDS_RAW`. Поведение админ-команд не менялось в рамках `bot-user-journey-fixes`.
 
 #### `admin_clear` — `text=["очистить", "сбросить"]`
 
@@ -310,27 +384,29 @@ JSON-хранилище участников. Безопасен в рамках
 
 ## `src/scheduler.py`
 
-Еженедельный планировщик сброса списка, анонса и напоминания.
+Еженедельный планировщик: анонс нового сбора и напоминание. Анонс защищён
+жизненным циклом регистрации (`mark_opening` → `_send_announcement` →
+`start_new_collection`), так что при сбое VK участники не теряются.
 
 ### `_next_target(now: datetime.datetime, weekday: int, hour: int, minute: int) -> datetime.datetime`
 
 Чистая функция. Вычисляет ближайший future datetime по заданному дню недели и времени. Если цель уже прошла сегодня — сдвигает на 7 дней вперёд.
 
-### `async _send_announcement(api: API, config: Config, inline_keyboard: str) -> None`
+### `async _send_announcement(api: API, config: Config, inline_keyboard: str) -> int | None`
 
-Отправляет еженедельный анонс через `api.messages.send(...)` с inline-клавиатурой.
+Отправляет еженедельный анонс через `api.messages.send(...)` с inline-клавиатурой. Возвращает ID отправленного сообщения (`int`) или `None`, если VK вернул значение, которое не является `int` (например, массив ошибки под нагрузкой).
 
 ### `async _send_reminder(api: API, config: Config, inline_keyboard: str, storage: Storage) -> None`
 
-Отправляет напоминание с текущим списком участников. **Не очищает** хранилище.
+Отправляет напоминание с текущим списком участников. **Не очищает** хранилище и не меняет состояние регистрации.
 
 ### `def _pick_next_event(collect_target: datetime.datetime, remind_target: datetime.datetime | None) -> tuple[datetime.datetime, str]`
 
 Выбирает ближайшее событие из двух target'ов. Возвращает `(target, event_label)`, где `event_label` — `"collect"` или `"remind"`.
 
-### `async _run_with_retry(label: str, operation: Callable[[], Awaitable[None]]) -> None`
+### `async _run_with_retry[T](label: str, operation: Callable[[], Awaitable[T]]) -> T`
 
-Выполняет операцию с ретрай-логикой: при сбое `OSError`, `TimeoutError` или `VKAPIError` ждёт 5 минут и повторяет.
+Выполняет операцию с ретрай-логикой: при сбое `OSError`, `TimeoutError` или `VKAPIError` ждёт 5 минут и повторяет; пробрасывает `anyio.get_cancelled_exc_class()` без задержки.
 
 ### `run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn`
 
@@ -350,12 +426,15 @@ JSON-хранилище участников. Безопасен в рамках
    - `await anyio.sleep(sleep_seconds)`
 
 4. **Действие:**
-   - **Сбор** (`event == "collect"`): один раз вызывает `storage.clear()`, затем отправляет анонс
-   - **Напоминание** (`event == "remind"`): отправляет текущий список участников
+   - **Сбор** (`event == "collect"`):
+     1. `await storage.mark_opening()` — переводит регистрацию в `opening`, **сохраняя** участников и `status_message_id`. Этот шаг ровно один, и до успешной отправки список не очищается.
+     2. `message_id = await _run_with_retry("Weekly announcement", _send_announcement)` — повторяется каждые 5 минут при сбоях.
+     3. `await storage.start_new_collection(message_id)` — атомарно очищает участников, переводит регистрацию в `open` и сохраняет ID нового анонса как канонический статус.
+   - **Напоминание** (`event == "remind"`): отправляет текущий список участников без касания состояния.
 
 5. **Обработка ошибок:**
-   - При сбое отправки `OSError`, `TimeoutError` или `VKAPIError` — логирует ошибку, ждёт 5 минут и повторяет только отправку
-   - При успехе — переходит к шагу 1
+   - Сбои `OSError`, `TimeoutError` или `VKAPIError` в `_send_announcement` / `_send_reminder` логируются, ждут 5 минут и повторяют только отправку. Состояние `opening` остаётся до успеха — после перезапуска `_load()` нормализует его в `closed` с сохранением участников.
+   - При успехе — переходит к шагу 1.
 
 **Тип возвращаемого значения:** `NoReturn` — функция никогда не завершается нормально.
 
@@ -401,16 +480,17 @@ async def main() -> None:
 
 ### Invariant'ы Storage
 
-- `_entries` всегда синхронизирован с файлом `_path`
-- Ошибка сохранения не публикует список-кандидат в `_entries`
-- После любого публичного метода (`add_*`, `remove_*`, `clear`) файл актуален
+- `_entries`, `_registration_state` и `_status_message_id` всегда синхронизированы с файлом `_path` после успешной записи
+- Ошибка сохранения не публикует снимок-кандидат в живое состояние
+- После любого публичного метода (`add_*`, `remove_*`, `clear`, `mark_opening`, `start_new_collection`, `set_status_message_id`) файл актуален
 - `list_entries()` возвращает копию — изменение возвращённого списка не влияет на хранилище
+- `_load()` нормализует сохранённое состояние `opening` в `closed` без потери участников, поэтому частично выполненный сценарий анонса безопасен после рестарта
 
 ### Контракты VK API
 
 - `bot.api.users.get()` работает с токеном сообщества (достаточно прав `messages` и `manage`)
 - `api.messages.send()` требует токен с правом `messages`
-- `random_id` должен быть уникальным в рамках 24 часов для данного peer_id
+- `random_id` генерируется через `secrets.randbelow(2_147_483_647)` (планировщик) или `secrets.randbits(31)` (callback-fallback в `update_callback_message`) — оба значения укладываются в 31-битное знаковое пространство VK и уникальны в пределах окна, требуемого VK
 
 ### Ошибки, которые пробрасываются
 
@@ -418,8 +498,23 @@ async def main() -> None:
 |-------|-----------|---------|-----------|
 | `Config()` | `ValidationError` | Невалидные `.env` | Падает при старте |
 | `_StorageData.model_validate_json()` | `ValidationError` | Повреждённый JSON | Падает при старте |
-| `api.users.get()` | `VKAPIError` | Невалидный токен/ID | Handler отвечает сообщением или snackbar о временной ошибке |
-| `api.messages.send()` в scheduler | `VKAPIError` | Нет прав / временный сбой | Повторяется через 5 минут |
+| `api.users.get()` | `VKAPIError` | Невалидный токен/ID | `join_user` возвращает `"Не удалось получить данные из VK. Попробуй позже."`, `sign_up` отвечает этим текстом, `cb_join` показывает его в snackbar |
+| `api.messages.send()` в scheduler | `VKAPIError` | Нет прав / временный сбой | `_run_with_retry` повторяет через 5 минут |
+| `event.edit_message()` в `update_callback_message` | `VKAPIError` | Сообщение слишком старое или удалено | Один fallback на `messages.send` + `set_status_message_id`, чат получает ровно одну замену |
+| `bot.api.messages.edit()` в `refresh_canonical_status` | `VKAPIError` | Канонический статус устарел | Логируется, чат не получает нового сообщения; следующая попытка после очередной мутации |
+
+### Жизненный цикл регистрации
+
+Состояние регистрации и `status_message_id` хранятся в одном JSON с участниками
+и обновляются атомарно. Это даёт три гарантии:
+
+1. **Участники не теряются при сбое анонса.** `mark_opening` сохраняет их до
+   отправки, и `_load` нормализует прерванное `opening` в `closed`.
+2. **Очистка и открытие происходят одним коммитом.** `start_new_collection`
+   единственный метод, который и стирает список, и переключает состояние.
+3. **Callback-кнопки редактируют канонический статус.** Если редактирование
+   не удалось, новая замена сохраняется через `set_status_message_id`, и
+   дальнейшие правки идут уже в неё.
 
 ### Потокобезопасность
 
