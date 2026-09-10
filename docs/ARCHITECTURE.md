@@ -163,9 +163,9 @@ closed ───────────────────────▶ 
 
 - Токен VK хранится только в переменных окружения (`.env` в `.gitignore`)
 - Все команды и callback-события ограничены одним настроенным `CHAT_PEER_ID`
-- `random_id` для VK API генерируется через `secrets.randbelow()` (криптографически безопасный)
-- Нет eval/exec, нет динамических импортов
-- JSON парсится через Pydantic — инъекция невозможна
+- `random_id` для VK API генерируется через `secrets.randbelow()` или `secrets.randbits()`
+- В рабочем коде нет `eval`/`exec`
+- JSON разбирается в типизированную Pydantic-модель; данные с неверной схемой отклоняются при старте
 
 ## Масштабируемость
 
@@ -180,7 +180,7 @@ closed ───────────────────────▶ 
 ## Тестируемость
 
 Каждый модуль изолирован и покрыт тестами:
-- `Config` — `tests/test_config.py`: валидация `collect_weekday` и `collect_time`
+- `Config` — `tests/test_config.py`: обязательные поля, расписание, admin ID и безопасный путь к данным
 - `Storage` — `tests/test_storage.py`: операции add/remove/clear на временном файле (`tmp_path`)
 - `bot.py` — `tests/test_bot.py` и `tests/test_bot_handlers.py`: peer-guard и зарегистрированные хендлеры с реальным временным `Storage`
 - `scheduler.py` — `tests/test_scheduler.py`: чистая логика `_next_target` без sleep, dual-event loop (collect + remind)

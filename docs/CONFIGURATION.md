@@ -9,7 +9,7 @@
 | Переменная | Тип | Пример | Описание |
 |------------|-----|--------|----------|
 | `VK_TOKEN` | `str` | `vk1.a.xxx...` | Токен сообщества VK с правами **messages** и **manage** |
-| `CHAT_PEER_ID` | `int` | `2000000001` | `peer_id` группового чата |
+| `CHAT_PEER_ID` | `int` | `2000000001` | Положительный `peer_id` группового чата (`>= 1`) |
 
 ### Опциональные переменные
 
@@ -21,7 +21,7 @@
 | `REMIND_WEEKDAY` | `int` (0–6) | `0` | День недели напоминания: `0`=Понедельник, `6`=Воскресенье |
 | `REMIND_TIME` | `str` (HH:MM) | `08:00` | Локальное время напоминания. Тот же формат и валидация, что и `COLLECT_TIME`; при включённом напоминании момент не может совпадать со сбором |
 | `ADMIN_VK_IDS_RAW` | `str` | `""` | Положительные VK ID администраторов через запятую. Парсится и валидируется при старте |
-| `DATA_PATH` | `str` | `data.json` локально, `/app/data/participants.json` в Docker | Путь к JSON-файлу со списком участников |
+| `DATA_PATH` | `str` | `data.json` локально, `/app/data/participants.json` в Docker | Путь к JSON-файлу; компоненты `..` запрещены |
 
 ## Файл `.env.example`
 
@@ -148,8 +148,13 @@ sudo timedatectl set-timezone Europe/Moscow
 
 ```dockerfile
 ENV TZ=Europe/Moscow
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 ```
+
+Текущий образ устанавливает базу часовых поясов `tzdata` и задаёт `TZ`; это
+соответствует корневому `Dockerfile`.
 
 ## Хранилище
 
@@ -179,8 +184,14 @@ cp data.json data.json.backup.$(date +%Y%m%d)
   "participants": [
     { "kind": "user", "vk_id": 123456789, "name": "Иван" },
     { "kind": "friend", "name": "Петр" }
-  ]
+  ],
+  "registration_state": "closed",
+  "status_message_id": null
 }
 ```
+
+Старые файлы только с полем `participants` тоже читаются: отсутствующие поля
+получат значения `closed` и `null`. Для новых ручных переносов используйте
+полную актуальную схему выше.
 
 Файл читается **только при старте** (`Storage.__init__`). Если вы отредактируете JSON вручную во время работы бота, изменения будут перезаписаны при следующей операции записи из памяти. Чтобы применить ручные правки — перезапустите бот или добавьте участника через бот (это вызовет `_save()` с актуальным in-memory списком).

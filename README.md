@@ -81,7 +81,8 @@ peer_id = 2000000000 + chat_id
 
 **Способ 4 (API):**
 ```bash
-curl "https://api.vk.com/method/messages.getConversations?access_token=$VK_TOKEN&v=5.199"
+printf 'access_token=%s&v=5.199' "$VK_TOKEN" \
+  | curl -sS --data-binary @- https://api.vk.com/method/messages.getConversations
 ```
 Ищи нужный чат в `response.items[].conversation.peer.id`.
 
@@ -171,7 +172,8 @@ uv run python -m src.main
 - [x] Inline-клавиатура VK
 - [x] Напоминание в заданный день недели перед сбором
 - [x] Админ-команды (очистить, удалить участника)
-- [ ] Лимит участников и очередь ожидания
+- [x] Фиксированный лимит списка: 100 участников
+- [ ] Очередь ожидания
 - [ ] SQLite вместо JSON
 - [x] CI: GitHub Actions для ветки `master`
 

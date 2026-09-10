@@ -10,7 +10,7 @@ Serverless-развёртывание VK Volleyball Bot без управлен�
 
 **Важный нюанс:** VK бот — это background worker (long-polling к VK API), а не web-сервис. Чтобы он работал 24/7, нужно настроить **минимум 1 "горячий" экземпляр** (min instances = 1). "Горячие" экземпляры остаются активными даже при отсутствии входящих HTTP-запросов.
 
-> Образ запускается не от `root`, поэтому смонтированный `/app/data` должен быть writable для `botuser`. Конфигурация контейнера здесь соответствует тем же лимитам: `256 MB RAM` и `0.5 vCPU`.
+> Образ запускается не от `root`, поэтому смонтированный `/app/data` должен быть writable для `botuser`. В качестве стартовой конфигурации ниже используются `256 MB RAM` и `0.1 vCPU`; после запуска проверьте метрики и увеличьте ресурсы при необходимости.
 
 ---
 
@@ -29,39 +29,60 @@ Serverless-развёртывание VK Volleyball Bot без управлен�
 Убедитесь, что в `Dockerfile` используется `ghcr.io/astral-sh/uv:python3.12-bookworm-slim` или аналогичный образ, и `CMD` запускает бота через модульный entrypoint:
 
 ```dockerfile
+# Используем официальный образ uv с Python 3.12
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+# Установка часового пояса (опционально — измените TZ под ваш регион)
 ENV TZ=Europe/Moscow
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
-    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
+
+# Создаём не-root пользователя и директорию для данных до COPY
+RUN useradd --uid 1000 --create-home --home-dir /home/botuser --shell /usr/sbin/nologin botuser \
+    && mkdir -p /app/data
+
+# Копируем lock-файл и pyproject.toml первыми для оптимизации слоёв Docker
+COPY --chown=botuser:botuser pyproject.toml uv.lock ./
+
+# Устанавливаем production-зависимости (без dev-группы)
 RUN uv sync --frozen --no-dev
-COPY src ./src
-RUN mkdir -p /app/data \
-    && useradd --uid 1000 --create-home --home-dir /home/botuser --shell /usr/sbin/nologin botuser \
-    && chown -R botuser:botuser /app
+
+# Копируем исходный код
+COPY --chown=botuser:botuser src ./src
+
+VOLUME ["/app/data"]
+
+# По умолчанию внутри контейнера пишем в volume
 ENV DATA_PATH=/app/data/participants.json
+
+# Работаем не от root
 USER botuser
+
+# Проверяем, что volume с данными доступен для записи
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD test -w /app/data
+
+# Запуск бота через uv run с модульным entrypoint
 CMD ["uv", "run", "--no-sync", "python", "-m", "src.main"]
 ```
 
 ### Шаг 2: Сборка и пуш в Artifact Registry
 
 ```bash
-# Логин в реестр (создайте сервисный аккаунт с ролями container-registry.images.puller + pusher)
-docker login cr.cloud.ru -u <Access_Key_ID> -p <Secret_Key>
+# Создайте сервисный аккаунт с правами push/pull и выполните команду входа,
+# которую показывает панель Artifact Registry
+docker login <registry-host> -u <registry-user>
 
-# Сборка
-docker build -t cr.cloud.ru/<project_id>/<repo>/vk-volleyball-bot:latest .
+IMAGE_URI=<registry-host>/<project>/<repository>/vk-volleyball-bot:latest
+docker build -t "$IMAGE_URI" .
 
 # Пуш
-docker push cr.cloud.ru/<project_id>/<repo>/vk-volleyball-bot:latest
+docker push "$IMAGE_URI"
 ```
 
-> Адрес реестра (`cr.cloud.ru/...`) берётся из панели Artifact Registry.
+> URI и endpoint не составляйте вручную: скопируйте их из панели Artifact Registry.
 
 ### Шаг 3: Создание бакета в Object Storage для данных
 
@@ -85,7 +106,7 @@ VK бот пишет `data.json` при каждой записи/отписке
 | **Название** | `vk-volleyball-bot` | Глобально уникальное |
 | **Конфигурация** | 0.1 vCPU — 256 MB RAM | Минимально достаточно для бота |
 | **URI образа** | `cr.cloud.ru/.../vk-volleyball-bot:latest` | Из Artifact Registry |
-| **Порт контейнера** | `8080` | Фиктивный (бот не слушает HTTP, но поле обязательно) |
+| **Порт контейнера** | `8080` | Значение для обязательного поля; бот HTTP не слушает, публичный адрес не включайте |
 | **Команда точки входа** | `uv` | Перезаписывает CMD образа |
 | **Аргументы** | `run, --no-sync, python, -m, src.main` | Аргументы для команды |
 
@@ -106,7 +127,7 @@ VK бот пишет `data.json` при каждой записи/отписке
 
 > **Важно:** `DATA_PATH` должен указывать на файл внутри смонтированного тома (`/app/data/participants.json`), а не на локальный путь из `.env.example`.
 
-#### Health-проба (обязательно)
+#### Health-проба
 
 VK бот — не HTTP-сервис, поэтому используйте **exec-пробу**:
 
@@ -129,7 +150,11 @@ VK бот — не HTTP-сервис, поэтому используйте **ex
 | **Путь** | `/app/data` |
 | **Только чтение** | Выключено |
 
-> Путь `/app/data` внутри контейнера будет смонтирован к бакету Object Storage. Все изменения `participants.json` сохраняются в S3.
+> Путь `/app/data` внутри контейнера монтируется к бакету Object Storage. После
+> первого запуска обязательно проверьте запись и повторное чтение
+> `participants.json`: `Storage` использует временный файл и `replace()`, поэтому
+> том должен поддерживать эти файловые операции. Если проверка не проходит,
+> используйте VM + Docker Compose из [CLOUDRU.md](CLOUDRU.md).
 
 #### Масштабирование (критически важно)
 
@@ -145,8 +170,8 @@ VK бот — не HTTP-сервис, поэтому используйте **ex
 
 #### Дополнительные опции
 
-- **Публичный адрес:** `Включён` (опционально — для health check извне или отладки)
-- **Авторизация:** `Выключена` (если включён публичный адрес)
+- **Публичный адрес:** `Выключен` — бот не предоставляет HTTP API
+- **Авторизация:** не требуется без публичного адреса
 - **Автоматическое развертывание:** `Включено` (при пуше нового образа в Artifact Registry)
 - **Логирование запросов:** `Включено` (для отладки)
 
@@ -160,7 +185,8 @@ VK бот — не HTTP-сервис, поэтому используйте **ex
 
 1. Откройте логи контейнера в панели cloud.ru
 2. Убедитесь, что бот стартовал без `ValidationError`
-3. Напишите `+` в групповой чат VK — бот должен ответить
+3. Напишите `?` в групповом чате VK — бот должен показать справку
+4. После анонса проверьте `записаться`, перезапустите ревизию и убедитесь, что участник сохранился
 
 ---
 
@@ -181,17 +207,19 @@ VK бот — не HTTP-сервис, поэтому используйте **ex
 При включённом **автоматическом развёртывании**:
 
 ```bash
-# Локально: внесите изменения, коммит, пуш
-git push origin main
+# Локально: внесите изменения, коммит, пуш в основную ветку репозитория
+git push origin master
 
 # Сборка и пуш нового образа
-docker build -t cr.cloud.ru/<project_id>/<repo>/vk-volleyball-bot:latest .
-docker push cr.cloud.ru/<project_id>/<repo>/vk-volleyball-bot:latest
+IMAGE_URI=<полный-URI-образа-из-Artifact-Registry>
+docker build -t "$IMAGE_URI" .
+docker push "$IMAGE_URI"
 ```
 
 Container Apps автоматически создаст новую **ревизию** и перезапустит контейнер.
 
-> Данные в `/app/data` (S3-бакет) сохранятся между ревизиями.
+> Данные в постоянном томе сохраняются между ревизиями. Проверяйте это
+> контрольной записью после изменений конфигурации тома.
 
 ---
 
@@ -220,7 +248,7 @@ Container Apps автоматически создаст новую **ревиз
 Причины:
 - `VK_TOKEN` не задан или невалидный — бот падает при старте
 - Health-проба падает — проверьте команду и начальную задержку
-- Порт 8080 занят или процесс не запускается — убедитесь, что `CMD` в Dockerfile корректен
+- Процесс не запускается — убедитесь, что `CMD` в Dockerfile не перезаписан неверной командой или аргументами
 
 ### Данные не сохраняются между ревизиями
 
@@ -249,16 +277,11 @@ curl -I https://api.vk.com
 
 ---
 
-## Оценка стоимости
+## Стоимость
 
-| Компонент | Конфигурация | Примерная цена (мес.) |
-|-----------|-------------|----------------------|
-| Container Apps | 0.1 vCPU, 256 MB RAM, min=1 | ~500 – 1 000 ₽ |
-| Object Storage | 1 GB + запросы | ~50 – 100 ₽ |
-| Artifact Registry | Хранение 1 образа | ~100 – 200 ₽ |
-| **Итого** | | **~650 – 1 300 ₽/мес.** |
-
-> **Бесплатный лимит:** ежемесячно начисляется 480 GB RAM и 120 vCPU. При 0.1 vCPU + 256 MB RAM бесплатного лимита может хватить на значительную часть месяца. Уточняйте в [прайсе cloud.ru](https://cloud.ru/pricing).
+Постоянный «горячий» экземпляр тарифицируется даже без входящих запросов.
+Стоимость также зависит от Object Storage, Artifact Registry и трафика;
+проверьте текущие условия в [прайсе cloud.ru](https://cloud.ru/pricing).
 
 ---
 
@@ -267,11 +290,12 @@ curl -I https://api.vk.com
 - [ ] Собран Docker-образ и загружен в Artifact Registry
 - [ ] Создан бакет Object Storage для данных
 - [ ] Создана Container App с min instances = **1**
-- [ ] Контейнер настроен на 256 MB RAM и 0.5 vCPU
+- [ ] Контейнер настроен минимум на 256 MB RAM и 0.1 vCPU; метрики после запуска проверены
 - [ ] Указаны все переменные окружения (`VK_TOKEN`, `CHAT_PEER_ID`, `DATA_PATH=/app/data/participants.json`)
 - [ ] Смонтирован постоянный том `/app/data` → S3-бакет
 - [ ] Настроена exec health-probe с начальной задержкой ≥30 сек
 - [ ] Образ работает не от `root`, том `/app/data` writable для `botuser`
 - [ ] Контейнер в статусе «Выполняется»
 - [ ] Логи показывают успешный старт бота
-- [ ] Тест в VK-чате (`+`, `список`) проходит успешно
+- [ ] Тест в VK-чате (`?`, затем после анонса `записаться` и `список`) проходит успешно
+- [ ] После перезапуска ревизии контрольная запись сохранилась в постоянном томе

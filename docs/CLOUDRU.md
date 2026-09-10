@@ -25,7 +25,7 @@
 | **ОС** | Ubuntu 24.04 LTS (или 22.04 LTS) |
 | **Конфигурация** | 1 vCPU, 2 ГБ RAM, 10 ГБ диска — минимально достаточно |
 | **Сеть** | Новая или существующая VPC |
-| **Публичный IP** | Обязательно (для доступа к VK API) |
+| **Публичный IP** | Нужен для прямого SSH; для VK API достаточно исходящего доступа через NAT |
 | **SSH-ключ** | Добавьте ваш публичный ключ |
 
 > Боту не нужен входящий доступ из интернета, кроме SSH. VK API исходящий — через NAT по умолчанию.
@@ -120,37 +120,30 @@ docker compose up -d --build
 
 ---
 
-## Способ 2: cloud.ru Container Registry
+## Способ 2: cloud.ru Artifact Registry
 
 Если хотите централизованно хранить образ и разворачивать на нескольких ВМ:
 
-### 1. Создание реестра
+### 1. Создание реестра и учётных данных
 
-Панель управления → **Container Registry** → **Создать реестр** → запомните адрес, например `cr.cloud.ru/vk-bot`.
-
-### 2. Создание сервисного аккаунта
-
-Панель управления → **Сервисные аккаунты** → **Создать**.
-
-Роли:
-- `container-registry.images.puller`
-- `container-registry.images.pusher`
-
-Сохраните `Access Key ID` и `Secret Key`.
+Создайте Docker-репозиторий в **Artifact Registry**. В панели реестра скопируйте
+точный URI образа и команду входа: endpoint и формат имени зависят от проекта.
+Создайте сервисный аккаунт с правами на push/pull и сохраните выданные данные.
 
 ### 3. Локальная сборка и пуш
 
 На вашей рабочей машине:
 
 ```bash
-# Логин в реестр
-docker login cr.cloud.ru -u <Access_Key_ID> -p <Secret_Key>
+# Выполните команду входа из панели Artifact Registry
+docker login <registry-host> -u <registry-user>
 
-# Сборка
-docker build -t cr.cloud.ru/vk-bot/vk-volleyball-bot:latest .
+# Используйте полный URI, скопированный из реестра
+IMAGE_URI=<registry-host>/<project>/<repository>/vk-volleyball-bot:latest
+docker build -t "$IMAGE_URI" .
 
 # Пуш
-docker push cr.cloud.ru/vk-bot/vk-volleyball-bot:latest
+docker push "$IMAGE_URI"
 ```
 
 ### 4. Запуск на ВМ из реестра
@@ -159,14 +152,14 @@ docker push cr.cloud.ru/vk-bot/vk-volleyball-bot:latest
 
 ```bash
 # Логин
-docker login cr.cloud.ru -u <Access_Key_ID> -p <Secret_Key>
+docker login <registry-host> -u <registry-user>
 
 # Создаём compose-файл без build
 mkdir ~/vk-bot && cd ~/vk-bot
 cat > compose.yml << 'EOF'
 services:
   vk-bot:
-    image: cr.cloud.ru/vk-bot/vk-volleyball-bot:latest
+    image: <полный-URI-образа-из-Artifact-Registry>
     container_name: vk-volleyball-bot
     restart: unless-stopped
     mem_limit: 256m
@@ -207,18 +200,22 @@ docker compose -f compose.yml up -d
 Если предпочитаете нативный запуск:
 
 ```bash
-# Установка uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.cargo/env
+# Системный пользователь и каталог
+sudo useradd --system --create-home --home-dir /home/botuser \
+  --shell /usr/sbin/nologin botuser
+sudo mkdir -p /opt/vk-volleyball-bot
+sudo chown botuser:botuser /opt/vk-volleyball-bot
+
+# Системная установка uv без изменения shell-профилей
+curl -LsSf https://astral.sh/uv/install.sh \
+  | sudo env UV_UNMANAGED_INSTALL=/usr/local/bin sh
 
 # Клонирование
-git clone <URL> /opt/vk-volleyball-bot
+sudo -u botuser git clone <URL> /opt/vk-volleyball-bot
 cd /opt/vk-volleyball-bot
-uv sync --no-dev
-
-# Пользователь
-sudo useradd -r -s /bin/false botuser
-sudo chown -R botuser:botuser /opt/vk-volleyball-bot
+sudo -u botuser /usr/local/bin/uv sync --frozen --no-dev
+sudo -u botuser cp .env.example .env
+# Отредактируйте /opt/vk-volleyball-bot/.env
 
 # systemd
 sudo tee /etc/systemd/system/vk-bot.service > /dev/null << 'EOF'
@@ -230,8 +227,8 @@ After=network.target
 Type=simple
 User=botuser
 WorkingDirectory=/opt/vk-volleyball-bot
-Environment="PATH=/home/botuser/.cargo/bin:/usr/local/bin:/usr/bin"
-ExecStart=/home/botuser/.cargo/bin/uv run python -m src.main
+Environment="PATH=/usr/local/bin:/usr/bin"
+ExecStart=/usr/local/bin/uv run --frozen --no-dev python -m src.main
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -284,15 +281,26 @@ aws configure
 
 ### 5. Скрипт бэкапа
 
+Имя Docker volume зависит от имени Compose-проекта. Сначала получите его:
+
+```bash
+docker volume ls
+```
+
+Подставьте фактическое имя в `VOLUME`:
+
 ```bash
 sudo tee /usr/local/bin/vk-bot-backup.sh > /dev/null << 'EOF'
 #!/bin/bash
 BUCKET="vk-bot-backups-<уникальный_id>"
-FILE="/var/lib/docker/volumes/vk-bot-data/_data/participants.json"
+VOLUME="<имя-volume-из-docker-volume-ls>"
 DATE=$(date +%Y%m%d-%H%M%S)
 
-if [ -f "$FILE" ]; then
-    aws s3 cp "$FILE" "s3://$BUCKET/backups/participants-$DATE.json" --endpoint-url=https://s3.cloud.ru
+if docker run --rm -v "$VOLUME:/data:ro" busybox \
+    test -f /data/participants.json; then
+    docker run --rm -v "$VOLUME:/data:ro" busybox \
+      cat /data/participants.json \
+      | aws s3 cp - "s3://$BUCKET/backups/participants-$DATE.json" --endpoint-url=https://s3.cloud.ru
     # Храним последние 7 бэкапов
     aws s3 ls "s3://$BUCKET/backups/" --endpoint-url=https://s3.cloud.ru | sort | head -n -7 | awk '{print $4}' | xargs -I {} aws s3 rm "s3://$BUCKET/backups/{}" --endpoint-url=https://s3.cloud.ru
 fi
@@ -343,14 +351,11 @@ docker stats vk-volleyball-bot --no-stream
 sudo systemctl status vk-bot
 ```
 
-### Health check через cloud.ru Monitoring (опционально)
+### Проверка работоспособности
 
-Если добавили HTTP health-check порт (см. `DEPLOYMENT.md` → Health check):
-
-1. Откройте порт **8080** в группе безопасности (для source = IP мониторинга).
-2. Настройте **Uptime Checks** в cloud.ru Monitoring на `http://<IP_ВМ>:8080`.
-
-> Встроенный Docker healthcheck и compose healthcheck проверяют только запись в `/app/data`, а не HTTP.
+HTTP endpoint у бота отсутствует. Встроенный Docker healthcheck проверяет только
+запись в `/app/data`; подключение к VK контролируйте по логам и тестовой команде
+в чате.
 
 ---
 
@@ -396,22 +401,17 @@ curl -I https://api.vk.com
 
 ---
 
-## Оценка стоимости
+## Стоимость
 
-| Компонент | Минимальная конфигурация | Примерная цена (мес.) |
-|-----------|-------------------------|----------------------|
-| Cloud Server | 1 vCPU, 2 GB RAM, 10 GB | ~1 500 – 2 500 ₽ |
-| Object Storage | 1 GB хранения + запросы | ~50 – 100 ₽ |
-| Публичный IP | 1 адрес | ~200 – 400 ₽ |
-| **Итого** | | **~1 800 – 3 000 ₽/мес.** |
-
-> Цены актуальны на 2026 г., уточняйте в [прайсе cloud.ru](https://cloud.ru/pricing).
+Стоимость зависит от региона, конфигурации ВМ, публичного IP, объёма Object
+Storage и трафика. Рассчитайте текущую сумму в
+[калькуляторе cloud.ru](https://cloud.ru/pricing) перед созданием ресурсов.
 
 ---
 
 ## Чек-лист запуска
 
-- [ ] Создана ВМ с Ubuntu 24.04 и публичным IP
+- [ ] Создана ВМ с Ubuntu 24.04 и исходящим доступом в интернет; при прямом SSH назначен публичный IP
 - [ ] Настроена группа безопасности (SSH inbound, любой outbound)
 - [ ] Установлен Docker и Docker Compose
 - [ ] Volume `/app/data` writable для `botuser`
@@ -420,4 +420,4 @@ curl -I https://api.vk.com
 - [ ] Бот запущен через `docker compose up -d`
 - [ ] Логи проверены, бот отвечает в чате
 - [ ] (Опционально) Настроен бэкап в Object Storage
-- [ ] (Опционально) Настроен health check мониторинг
+- [ ] Проверены Docker healthcheck, логи и контрольная команда в VK-чате

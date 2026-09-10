@@ -42,26 +42,24 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # Установка часового пояса (опционально — измените TZ под ваш регион)
 ENV TZ=Europe/Moscow
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
-    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Создаём не-root пользователя и директорию для данных до COPY
+RUN useradd --uid 1000 --create-home --home-dir /home/botuser --shell /usr/sbin/nologin botuser \
+    && mkdir -p /app/data
+
 # Копируем lock-файл и pyproject.toml первыми для оптимизации слоёв Docker
-COPY pyproject.toml uv.lock ./
+COPY --chown=botuser:botuser pyproject.toml uv.lock ./
 
 # Устанавливаем production-зависимости (без dev-группы)
 RUN uv sync --frozen --no-dev
 
 # Копируем исходный код
-COPY src ./src
+COPY --chown=botuser:botuser src ./src
 
-# Создаём директорию для данных, пользователя и выдаём права на /app
-RUN mkdir -p /app/data \
-    && useradd --uid 1000 --create-home --home-dir /home/botuser --shell /usr/sbin/nologin botuser \
-    && chown -R botuser:botuser /app
 VOLUME ["/app/data"]
 
 # По умолчанию внутри контейнера пишем в volume
@@ -144,27 +142,35 @@ docker compose up -d
 
 ## Способ 2: VPS / Bare Metal
 
-### Установка uv
+### Подготовка пользователя и установка uv
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.cargo/env
+sudo useradd --system --create-home --home-dir /home/botuser \
+  --shell /usr/sbin/nologin botuser
+sudo mkdir -p /opt/vk-volleyball-bot
+sudo chown botuser:botuser /opt/vk-volleyball-bot
+
+# Установка в системный каталог без изменения shell-профилей
+curl -LsSf https://astral.sh/uv/install.sh \
+  | sudo env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+uv --version
 ```
 
 ### Клонирование и запуск
 
 ```bash
-git clone <repo-url>
-cd vk-volleyball-bot
-uv sync --no-dev
+sudo -u botuser git clone <repo-url> /opt/vk-volleyball-bot
+cd /opt/vk-volleyball-bot
+sudo -u botuser /usr/local/bin/uv sync --frozen --no-dev
 
 # Настройка окружения
-cp .env.example .env
+sudo -u botuser cp .env.example .env
 # отредактируйте .env
-
-# Запуск в фоне
-nohup uv run python -m src.main > bot.log 2>&1 &
 ```
+
+Официальный установщик `uv` поддерживает `UV_UNMANAGED_INSTALL`: бинарник
+попадает прямо в указанный каталог и установщик не меняет shell-профили. Это
+удобнее для systemd, где интерактивный профиль пользователя не загружается.
 
 ### Управление через systemd
 
@@ -179,8 +185,8 @@ After=network.target
 Type=simple
 User=botuser
 WorkingDirectory=/opt/vk-volleyball-bot
-Environment="PATH=/home/botuser/.cargo/bin:/usr/local/bin:/usr/bin"
-ExecStart=/home/botuser/.cargo/bin/uv run python -m src.main
+Environment="PATH=/usr/local/bin:/usr/bin"
+ExecStart=/usr/local/bin/uv run --frozen --no-dev python -m src.main
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -206,19 +212,11 @@ sudo systemctl restart vk-bot
 sudo systemctl stop vk-bot
 ```
 
-### Создание пользователя (рекомендуется)
-
-```bash
-sudo useradd -r -s /bin/false botuser
-sudo mkdir -p /opt/vk-volleyball-bot
-sudo chown botuser:botuser /opt/vk-volleyball-bot
-```
-
-## Способ 3: Render / Railway / Heroku
+## Способ 3: Render / Railway
 
 ### Render
 
-1. Создайте Web Service (или Background Worker)
+1. Создайте **Background Worker**, а не Web Service: бот не слушает HTTP-порт
 2. Укажите Build Command: `uv sync --no-dev`
 3. Укажите Start Command: `uv run python -m src.main`
 4. Добавьте Environment Variables в панели
@@ -230,7 +228,7 @@ sudo chown botuser:botuser /opt/vk-volleyball-bot
 1. Подключите GitHub-репозиторий
 2. Railway автоматически определит Python-проект
 3. Установите переменные окружения в Variables
-4. Добавьте `NIXPACKS_UV_VERSION=0.5` если нужна конкретная версия uv
+4. Укажите Start Command: `uv run --frozen --no-dev python -m src.main`
 
 ## Мониторинг
 
@@ -255,21 +253,12 @@ tail -f bot.log
 
 Если бот не отвечает в чате:
 1. Проверьте логи на ошибки авторизации VK
-2. Убедитесь, что бот добавлен в чат и является администратором
+2. Убедитесь, что бот добавлен в чат и имеет доступ ко всей переписке
 3. Проверьте `CHAT_PEER_ID` — должен соответствовать реальному чату
 4. Убедитесь, что у токена есть права `messages` и `manage`
 
-### Health check (опционально)
+### Health check
 
-Можно добавить простой HTTP health check, если бот запущен как web service:
-
-```python
-# Добавить в main.py
-from anyio import create_tcp_listener
-
-async def health_server():
-    listener = await create_tcp_listener(local_port=8080)
-    await listener.serve(lambda stream: stream.send(b"OK"))
-```
-
-Затем настройте мониторинг через UptimeRobot / Pingdom на порт 8080.
+HTTP health endpoint в приложении отсутствует. Встроенный Docker healthcheck
+проверяет только доступность `/app/data` для записи; фактическое подключение к
+VK проверяйте по логам и контрольной команде в целевом чате.
