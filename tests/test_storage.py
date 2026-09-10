@@ -60,8 +60,8 @@ async def test_storage_loads_legacy_participants_as_closed(tmp_path: Path) -> No
 
 
 @pytest.mark.anyio
-async def test_storage_recovers_opening_state_as_closed(tmp_path: Path) -> None:
-    """Given an interrupted opening, loading closes it without clearing entries."""
+async def test_storage_preserves_opening_for_recovery(tmp_path: Path) -> None:
+    """An interrupted opening remains pending without clearing entries."""
     # Given
     path = tmp_path / "participants.json"
     path.write_text(
@@ -77,9 +77,49 @@ async def test_storage_recovers_opening_state_as_closed(tmp_path: Path) -> None:
     storage = Storage(path)
 
     # Then
-    assert await storage.registration_state() == "closed"
+    assert await storage.registration_state() == "opening"
     assert await storage.is_registration_open() is False
     assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("finish_opening", [False, True])
+async def test_guarded_registration_rejects_previous_collection(
+    tmp_path: Path, finish_opening: bool
+) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    await storage.start_new_collection(1)
+    collection = await storage.active_collection()
+    assert collection is not None
+    await storage.mark_opening()
+    if finish_opening:
+        await storage.start_new_collection(2)
+    with pytest.raises(ValueError, match="сбор изменился"):
+        await storage.add_user(1, "Alice", expected_collection=collection)
+    with pytest.raises(ValueError, match="сбор изменился"):
+        await storage.add_friend("Bob", expected_collection=collection)
+    assert await storage.list_entries() == []
+
+
+@pytest.mark.anyio
+async def test_opening_identifier_survives_restart_and_mutations(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.start_new_collection(1)
+    collection = await storage.active_collection()
+    await storage.mark_opening()
+    random_id = await storage.announcement_random_id()
+    assert random_id is not None
+    await storage.clear()
+    await storage.set_status_message_id(2)
+    restored = Storage(path)
+    await restored.mark_opening()
+    assert await restored.announcement_random_id() == random_id
+    await restored.start_new_collection(3)
+    assert await restored.active_collection() != collection
+    assert await restored.announcement_random_id() is None
 
 
 @pytest.mark.anyio

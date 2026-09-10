@@ -255,6 +255,10 @@ async def test_scheduler_preserves_participants_while_announcement_is_retried(
 
     # Then: it preserves the prior collection while opening is retried
     assert api.messages.send.await_count == 2
+    assert (
+        api.messages.send.await_args_list[0].kwargs["random_id"]
+        == api.messages.send.await_args_list[1].kwargs["random_id"]
+    )
     assert sleep_durations == [3600.0, 300.0, 3600.0]
     assert "Weekly announcement failed; retrying in five minutes" in caplog.text
     assert failed_attempt_participants == ["Alice"]
@@ -273,6 +277,8 @@ async def test_scheduler_starts_new_collection_once_when_announcement_is_retried
     api = MagicMock()
     api.messages.send = AsyncMock(side_effect=[OSError("VK unavailable"), 1])
     storage = MagicMock(spec=Storage)
+    storage.registration_state = AsyncMock(return_value="closed")
+    storage.announcement_random_id = AsyncMock(return_value=42)
     storage.mark_opening = AsyncMock()
     storage.start_new_collection = AsyncMock()
     storage.clear = AsyncMock()
@@ -298,3 +304,54 @@ async def test_scheduler_starts_new_collection_once_when_announcement_is_retried
     storage.mark_opening.assert_awaited_once_with()
     storage.start_new_collection.assert_awaited_once_with(1)
     storage.clear.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_scheduler_resumes_pending_opening_before_sleep(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.add_friend("Previous participant")
+    await storage.mark_opening()
+    random_id = await storage.announcement_random_id()
+    restored = Storage(path)
+    api = MagicMock()
+    api.messages.send = AsyncMock(return_value=123)
+    monkeypatch.setattr(
+        scheduler.anyio, "sleep", AsyncMock(side_effect=StopSchedulerError)
+    )
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(api, config, restored)
+    api.messages.send.assert_awaited_once()
+    assert api.messages.send.await_args.kwargs["random_id"] == random_id
+    assert await Storage(path).registration_state() == "open"
+    assert await restored.status_message_id() == 123
+    assert await restored.list_entries() == []
+
+
+@pytest.mark.anyio
+async def test_activation_retry_does_not_resend_announcement(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    await storage.mark_opening()
+    activate = storage.start_new_collection
+    attempts = 0
+
+    async def fail_once(message_id: int | None) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            message = "disk unavailable"
+            raise OSError(message)
+        await activate(message_id)
+
+    monkeypatch.setattr(storage, "start_new_collection", fail_once)
+    monkeypatch.setattr(scheduler.anyio, "sleep", AsyncMock())
+    api = MagicMock()
+    api.messages.send = AsyncMock(return_value=123)
+    await scheduler._finish_opening(api, config, storage)
+    api.messages.send.assert_awaited_once()
+    assert attempts == 2
+    assert await storage.is_registration_open()

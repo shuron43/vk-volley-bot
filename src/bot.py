@@ -1,5 +1,6 @@
 """VK bot message handlers."""
 
+import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
@@ -37,6 +38,7 @@ def _admin_help_text() -> str:
 def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa: C901,PLR0915
     """Register message handlers on the bot instance."""
     inline_keyboard = build_inline_keyboard()
+    status_lock = asyncio.Lock()
     registration_closed_message = (
         "Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь»."
     )
@@ -47,7 +49,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
 
     async def join_user(vk_id: int) -> tuple[str, bool]:
         """Register a VK user and return feedback with its mutation result."""
-        if not await storage.is_registration_open():
+        collection = await storage.active_collection()
+        if collection is None:
             return registration_closed_message, False
         try:
             _users = await bot.api.users.get(user_ids=[vk_id])
@@ -56,10 +59,11 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             return "Не удалось получить данные из VK. Попробуй позже.", False
         name = (_users[0].first_name or "Unknown") if _users else "Unknown"
         try:
-            added = await storage.add_user(vk_id, name)
+            added = await storage.add_user(vk_id, name, expected_collection=collection)
         except ValueError as exc:
             return str(exc), False
         if added:
+            await refresh_canonical_status()
             _LOGGER.info("User %s (%s) signed up", vk_id, name)
             return "Ты записался!", True
         return "Ты уже в списке.", False
@@ -67,24 +71,28 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def leave_user(vk_id: int) -> tuple[str, bool]:
         """Remove a VK user and return feedback with its mutation result."""
         if await storage.remove_user(vk_id):
+            await refresh_canonical_status()
             _LOGGER.info("User %s signed off", vk_id)
             return "Ты отписался.", True
         return "Тебя не было в списке.", False
 
     async def add_friend_by_name(name: str) -> str:
         """Register a friend and return the result message."""
-        if not await storage.is_registration_open():
+        collection = await storage.active_collection()
+        if collection is None:
             return registration_closed_message
         try:
-            await storage.add_friend(name)
+            await storage.add_friend(name, expected_collection=collection)
         except ValueError as exc:
             return str(exc)
+        await refresh_canonical_status()
         _LOGGER.info("Friend added: %s", name)
         return f"{name} записан(а) как друг."
 
     async def remove_friend_by_name(name: str) -> str:
         """Remove a friend and return the result message."""
         if await storage.remove_friend(name):
+            await refresh_canonical_status()
             _LOGGER.info("Friend removed: %s", name)
             return f"{name} убран(а) из списка."
         return "Такого друга не нашлось."
@@ -107,6 +115,11 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
 
     async def refresh_canonical_status() -> None:
         """Refresh the persisted registration status message when it is known."""
+        async with status_lock:
+            await edit_canonical_status()
+
+    async def edit_canonical_status() -> None:
+        """Read and publish the latest list while holding the status lock."""
         status_message_id = await storage.status_message_id()
         if status_message_id is None:
             return
@@ -118,7 +131,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
                 message=format_entries(entries),
                 keyboard=inline_keyboard,
             )
-        except VKAPIError:
+        except (VKAPIError, OSError, TimeoutError):
             _LOGGER.exception("Failed to refresh canonical status message")
 
     def target_peer_only(
@@ -222,9 +235,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def cb_join(event: MessageEvent) -> None:
         # Shares join_user with sign_up.
-        response, changed = await join_user(event.user_id)
-        if changed:
-            await refresh_canonical_status()
+        response, _ = await join_user(event.user_id)
         _ = await event.show_snackbar(response)
 
     @bot.on.raw_event(
@@ -235,9 +246,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def cb_leave(event: MessageEvent) -> None:
         # Shares leave_user with sign_off.
-        response, changed = await leave_user(event.user_id)
-        if changed:
-            await refresh_canonical_status()
+        response, _ = await leave_user(event.user_id)
         _ = await event.show_snackbar(response)
 
     @bot.on.raw_event(
@@ -248,8 +257,10 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def cb_list(event: MessageEvent) -> None:
         # Duplicates show_list — keep in sync.
-        entries = await storage.list_entries()
-        if await update_callback_message(event, format_entries(entries)):
+        async with status_lock:
+            entries = await storage.list_entries()
+            updated = await update_callback_message(event, format_entries(entries))
+        if updated:
             _ = await event.show_snackbar("Список обновлён в сообщении бота.")
 
     @bot.on.raw_event(
@@ -259,7 +270,9 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_help(event: MessageEvent) -> None:
-        if await update_callback_message(event, help_text(compact=True)):
+        async with status_lock:
+            updated = await update_callback_message(event, help_text(compact=True))
+        if updated:
             _ = await event.show_snackbar("Справка обновлена.")
 
     # --- Admin handlers ---
@@ -275,6 +288,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             )
             return
         await storage.clear()
+        await refresh_canonical_status()
         _LOGGER.info("List cleared by admin %s", msg.from_id)
         _ = await msg.answer(
             "Список участников очищен.",
@@ -293,6 +307,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             return
         name = (msg.text or "").split(maxsplit=1)[1].strip()
         if await storage.remove_by_name(name):
+            await refresh_canonical_status()
             _LOGGER.info("Admin %s removed %s", msg.from_id, name)
             _ = await msg.answer(
                 f"{name} убран(а) из списка.",

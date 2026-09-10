@@ -37,14 +37,16 @@ def _next_target(
 
 
 async def _send_announcement(
-    api: API, config: Config, inline_keyboard: str
+    api: API, config: Config, inline_keyboard: str, random_id: int | None = None
 ) -> int | None:
     """Send the weekly collection announcement to the configured chat."""
     message_id = await api.messages.send(
         peer_id=config.chat_peer_id,
         message=_ANNOUNCEMENT_MESSAGE,
         keyboard=inline_keyboard,
-        random_id=secrets.randbelow(2_147_483_647),
+        random_id=random_id
+        if random_id is not None
+        else secrets.randbelow(2_147_483_646) + 1,
     )
     return message_id if type(message_id) is int else None
 
@@ -97,6 +99,20 @@ async def _run_with_retry[T](
             return result
 
 
+async def _finish_opening(api: API, config: Config, storage: Storage) -> None:
+    """Resume delivery and durable activation of an interrupted collection."""
+    if await storage.announcement_random_id() is None:
+        await storage.mark_opening()
+    random_id = await storage.announcement_random_id()
+    message_id = await _run_with_retry(
+        "Weekly announcement",
+        partial(_send_announcement, api, config, build_inline_keyboard(), random_id),
+    )
+    await _run_with_retry(
+        "Collection activation", partial(storage.start_new_collection, message_id)
+    )
+
+
 async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
     """Loop forever, waiting for the configured weekday/time."""
     weekday = config.collect_weekday
@@ -112,6 +128,10 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
         minute,
         config.remind_enabled,
     )
+
+    if await storage.registration_state() == "opening":
+        _LOGGER.info("Resuming interrupted collection opening")
+        await _finish_opening(api, config, storage)
 
     while True:
         now = datetime.datetime.now()  # noqa: DTZ005
@@ -140,11 +160,7 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
         if event == "collect":
             await storage.mark_opening()
             _LOGGER.info("Participant list marked opening for new collection")
-            message_id = await _run_with_retry(
-                "Weekly announcement",
-                partial(_send_announcement, api, config, inline_keyboard),
-            )
-            await storage.start_new_collection(message_id)
+            await _finish_opening(api, config, storage)
             _LOGGER.info("Participant list cleared and opened for new collection")
         else:
             await _run_with_retry(

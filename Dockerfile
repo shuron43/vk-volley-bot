@@ -11,7 +11,8 @@ WORKDIR /app
 
 # Создаём не-root пользователя и директорию для данных до COPY
 RUN useradd --uid 1000 --create-home --home-dir /home/botuser --shell /usr/sbin/nologin botuser \
-    && mkdir -p /app/data
+    && mkdir -p /app/data \
+    && chown botuser:botuser /app/data
 
 # Копируем lock-файл и pyproject.toml первыми для оптимизации слоёв Docker
 COPY --chown=botuser:botuser pyproject.toml uv.lock ./

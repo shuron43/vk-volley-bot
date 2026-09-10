@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+import secrets
 from pathlib import Path
-from typing import Annotated, ClassVar, Final, Literal, assert_never
+from typing import Annotated, ClassVar, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,6 +13,9 @@ _MAX_ENTRIES: Final = 100
 _NAME_TOO_LONG_MSG = f"Name exceeds {_MAX_NAME_LENGTH} characters"
 _LIMIT_REACHED_MSG = f"Participant limit ({_MAX_ENTRIES}) reached"
 _LOGGER: Final = logging.getLogger(__name__)
+_REGISTRATION_CHANGED_MSG = (
+    "Запись закрыта или сбор изменился. Попробуй записаться снова."
+)
 
 
 class UserEntry(BaseModel):
@@ -39,6 +43,8 @@ class _StorageData(BaseModel):
     participants: tuple[Annotated[Entry, Field(discriminator="kind")], ...]
     registration_state: Literal["closed", "opening", "open"] = "closed"
     status_message_id: int | None = None
+    collection_id: int = 0
+    announcement_random_id: int | None = None
 
 
 class Storage:
@@ -50,6 +56,8 @@ class Storage:
         self._entries: list[Entry] = []
         self._registration_state: Literal["closed", "opening", "open"] = "closed"
         self._status_message_id: int | None = None
+        self._collection_id: int = 0
+        self._announcement_random_id: int | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._load()
 
@@ -59,13 +67,9 @@ class Storage:
             return
         data = _StorageData.model_validate_json(self._path.read_bytes())
         self._entries = list(data.participants)
-        match data.registration_state:
-            case "opening":
-                self._registration_state = "closed"
-            case "closed" | "open":
-                self._registration_state = data.registration_state
-            case unreachable:  # type: ignore[reportUnnecessaryComparison]
-                assert_never(unreachable)
+        self._registration_state = data.registration_state
+        self._collection_id = data.collection_id
+        self._announcement_random_id = data.announcement_random_id
         self._status_message_id = data.status_message_id
         _LOGGER.info("Loaded %d entries from %s", len(self._entries), self._path)
 
@@ -88,6 +92,8 @@ class Storage:
         self._entries = list(data.participants)
         self._registration_state = data.registration_state
         self._status_message_id = data.status_message_id
+        self._collection_id = data.collection_id
+        self._announcement_random_id = data.announcement_random_id
 
     async def _commit_entries(self, entries: list[Entry]) -> None:
         await self._commit(
@@ -95,14 +101,19 @@ class Storage:
                 participants=tuple(entries),
                 registration_state=self._registration_state,
                 status_message_id=self._status_message_id,
+                collection_id=self._collection_id,
+                announcement_random_id=self._announcement_random_id,
             )
         )
 
-    async def add_user(self, vk_id: int, name: str) -> bool:
+    async def add_user(
+        self, vk_id: int, name: str, *, expected_collection: int | None = None
+    ) -> bool:
         """Add a VK user if not already present. Returns True if added."""
         if len(name) > _MAX_NAME_LENGTH:
             raise ValueError(_NAME_TOO_LONG_MSG)
         async with self._lock:
+            self._check_collection(expected_collection)
             if any(e.kind == "user" and e.vk_id == vk_id for e in self._entries):
                 return False
             if len(self._entries) >= _MAX_ENTRIES:
@@ -125,11 +136,14 @@ class Storage:
                     return True
             return False
 
-    async def add_friend(self, name: str) -> None:
+    async def add_friend(
+        self, name: str, *, expected_collection: int | None = None
+    ) -> None:
         """Add a friend by name."""
         if len(name) > _MAX_NAME_LENGTH:
             raise ValueError(_NAME_TOO_LONG_MSG)
         async with self._lock:
+            self._check_collection(expected_collection)
             if len(self._entries) >= _MAX_ENTRIES:
                 raise ValueError(_LIMIT_REACHED_MSG)
             entries = [*self._entries, FriendEntry(kind="friend", name=name)]
@@ -169,6 +183,11 @@ class Storage:
                     participants=tuple(self._entries),
                     registration_state="opening",
                     status_message_id=self._status_message_id,
+                    collection_id=self._collection_id,
+                    announcement_random_id=(
+                        self._announcement_random_id
+                        or secrets.randbelow(2_147_483_646) + 1
+                    ),
                 )
             )
 
@@ -180,6 +199,7 @@ class Storage:
                     participants=(),
                     registration_state="open",
                     status_message_id=status_message_id,
+                    collection_id=self._collection_id + 1,
                 )
             )
 
@@ -191,6 +211,8 @@ class Storage:
                     participants=tuple(self._entries),
                     registration_state=self._registration_state,
                     status_message_id=message_id,
+                    collection_id=self._collection_id,
+                    announcement_random_id=self._announcement_random_id,
                 )
             )
 
@@ -198,6 +220,23 @@ class Storage:
         """Return whether the current collection accepts registrations."""
         async with self._lock:
             return self._registration_state == "open"
+
+    async def active_collection(self) -> int | None:
+        """Return the open collection token for a guarded registration."""
+        async with self._lock:
+            return self._collection_id if self._registration_state == "open" else None
+
+    async def announcement_random_id(self) -> int | None:
+        """Return the durable identifier of the pending announcement."""
+        async with self._lock:
+            return self._announcement_random_id
+
+    def _check_collection(self, expected_collection: int | None) -> None:
+        if expected_collection is not None and (
+            self._registration_state != "open"
+            or self._collection_id != expected_collection
+        ):
+            raise ValueError(_REGISTRATION_CHANGED_MSG)
 
     async def remove_by_name(self, name: str) -> bool:
         """Remove the first entry matching *name* (user or friend)."""

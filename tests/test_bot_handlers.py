@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -28,6 +29,7 @@ def _build_bot(storage: Storage, config: Config) -> Bot:
     api.users.get = AsyncMock(
         return_value=[SimpleNamespace(first_name="Alice")],
     )
+    api.messages.edit = AsyncMock()
     bot.api = api
     setup_handlers(bot, storage, config)
     return bot
@@ -48,6 +50,118 @@ def _callback_handlers(bot: Bot) -> dict[str, _CallbackHandler]:
         registered.handler.handler.__name__: registered.handler.handler
         for registered in registered_handlers
     }
+
+
+@pytest.mark.anyio
+async def test_signup_rejects_collection_changed_during_vk_lookup(
+    tmp_path: Path,
+) -> None:
+    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
+    storage = Storage(tmp_path / "participants.json")
+    await storage.start_new_collection(1)
+    bot = _build_bot(storage, config)
+
+    async def change_collection(**_kwargs: object) -> list[SimpleNamespace]:
+        await storage.mark_opening()
+        await storage.start_new_collection(2)
+        return [SimpleNamespace(first_name="Alice")]
+
+    bot.api.users.get = AsyncMock(side_effect=change_collection)
+    message = MagicMock(spec=Message)
+    message.peer_id = config.chat_peer_id
+    message.from_id = 1
+    message.answer = AsyncMock()
+    await _message_handlers(bot)["sign_up"](message)
+    assert await storage.list_entries() == []
+    assert "сбор изменился" in message.answer.await_args.args[0]
+    bot.api.messages.edit.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_all_text_mutations_refresh_status(tmp_path: Path) -> None:
+    config = Config(
+        vk_token=secrets.token_urlsafe(),
+        chat_peer_id=2_000_000_001,
+        admin_vk_ids=(1,),
+    )
+    storage = Storage(tmp_path / "participants.json")
+    await storage.start_new_collection(321)
+    bot = _build_bot(storage, config)
+    handlers = _message_handlers(bot)
+    message = MagicMock(spec=Message)
+    message.peer_id = config.chat_peer_id
+    message.from_id = 1
+    message.answer = AsyncMock()
+    for handler, text in [
+        ("sign_up", "записаться"),
+        ("add_friend", "+ Bob"),
+        ("remove_friend", "- Bob"),
+        ("sign_off", "отписаться"),
+        ("add_friend", "+ Bob"),
+        ("admin_remove", "удалить Bob"),
+        ("add_friend", "+ Carol"),
+        ("admin_clear", "очистить"),
+    ]:
+        message.text = text
+        before = bot.api.messages.edit.await_count
+        await handlers[handler](message)
+        assert bot.api.messages.edit.await_count == before + 1
+        assert bot.api.messages.edit.await_args.kwargs["message_id"] == 321
+    assert (
+        bot.api.messages.edit.await_args.kwargs["message"] == "Пока никто не записался."
+    )
+
+
+@pytest.mark.anyio
+async def test_concurrent_status_updates_publish_latest_list_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
+    storage = Storage(tmp_path / "participants.json")
+    await storage.start_new_collection(321)
+    bot = _build_bot(storage, config)
+    first_edit_started = asyncio.Event()
+    release_first_edit = asyncio.Event()
+    second_saved = asyncio.Event()
+    published: list[str] = []
+    add_friend = storage.add_friend
+
+    async def observe_add(name: str, *, expected_collection: int | None = None) -> None:
+        await add_friend(name, expected_collection=expected_collection)
+        if name == "Bob":
+            second_saved.set()
+
+    monkeypatch.setattr(storage, "add_friend", observe_add)
+
+    async def edit_message(**kwargs: str | int) -> None:
+        if not first_edit_started.is_set():
+            first_edit_started.set()
+            await release_first_edit.wait()
+        published.append(str(kwargs["message"]))
+
+    bot.api.messages.edit = AsyncMock(side_effect=edit_message)
+    handler = _message_handlers(bot)["add_friend"]
+
+    def message(name: str) -> MagicMock:
+        msg = MagicMock(spec=Message)
+        msg.peer_id = config.chat_peer_id
+        msg.text = f"+ {name}"
+        msg.answer = AsyncMock()
+        return msg
+
+    first = asyncio.create_task(handler(message("Alice")))
+    await asyncio.wait_for(first_edit_started.wait(), timeout=2)
+    second = asyncio.create_task(handler(message("Bob")))
+    try:
+        # Wait until the second mutation has reached publication, behind the first.
+        await asyncio.wait_for(second_saved.wait(), timeout=2)
+        assert bot.api.messages.edit.await_count == 1
+    finally:
+        release_first_edit.set()
+        await asyncio.gather(first, second)
+    assert "Alice" in published[-1]
+    assert "Bob" in published[-1]
 
 
 @pytest.mark.anyio
