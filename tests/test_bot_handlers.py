@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import secrets
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
-from src.bot import setup_handlers
+from src.bot import setup_handlers, temporary_answer
 from src.config import Config
 from src.storage import Storage
 from vkbottle import GroupEventType, VKAPIError
@@ -108,7 +109,8 @@ async def test_all_text_mutations_refresh_status(tmp_path: Path) -> None:
         assert bot.api.messages.edit.await_count == before + 1
         assert bot.api.messages.edit.await_args.kwargs["message_id"] == 321
     assert (
-        bot.api.messages.edit.await_args.kwargs["message"] == "Пока никто не записался."
+        bot.api.messages.edit.await_args.kwargs["message"]
+        == "🏐 Запись открыта · Участников: 0\n\nПока никто не записался."
     )
 
 
@@ -223,7 +225,7 @@ async def test_sign_up_when_registration_is_closed_refuses_before_vk_or_storage(
     bot.api.users.get.assert_not_awaited()
     assert await storage.list_entries() == []
     message.answer.assert_awaited_once_with(
-        "Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь».",
+        "Запись закрыта. Дождись следующего анонса или нажми «Помощь».",
         keyboard=ANY,
     )
 
@@ -252,7 +254,7 @@ async def test_callback_join_when_registration_is_closed_refuses_before_vk_or_st
     bot.api.users.get.assert_not_awaited()
     assert await storage.list_entries() == []
     event.show_snackbar.assert_awaited_once_with(
-        "Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь»."
+        "Запись закрыта. Дождись следующего анонса или нажми «Помощь»."
     )
 
 
@@ -281,7 +283,7 @@ async def test_add_friend_when_registration_is_closed_refuses_without_mutation(
     add_friend.assert_not_awaited()
     assert await storage.list_entries() == []
     message.answer.assert_awaited_once_with(
-        "Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь».",
+        "Запись закрыта. Дождись следующего анонса или нажми «Помощь».",
         keyboard=ANY,
     )
 
@@ -455,6 +457,35 @@ async def test_registered_admin_handlers_enforce_membership_and_mutate_storage(
 
 
 @pytest.mark.anyio
+async def test_admin_can_create_manual_event_with_documented_command(
+    tmp_path: Path,
+) -> None:
+    config = Config(
+        vk_token=secrets.token_urlsafe(),
+        chat_peer_id=2_000_000_001,
+        admin_vk_ids=(123,),
+    )
+    storage = Storage(tmp_path / "participants.json")
+    bot = _build_bot(storage, config)
+    message = MagicMock(spec=Message)
+    message.peer_id = config.chat_peer_id
+    message.from_id = 123
+    message.text = "создать событие 22.09.2099 19:30"
+    message.answer = AsyncMock()
+
+    with patch("src.bot.open_manual_event", new_callable=AsyncMock) as open_event:
+        await _message_handlers(bot)["admin_create_event"](message)
+
+    open_event.assert_awaited_once_with(
+        bot.api,
+        config,
+        storage,
+        datetime.datetime(2099, 9, 22, 19, 30),  # noqa: DTZ001
+    )
+    assert "запись открыта" in message.answer.await_args.args[0]
+
+
+@pytest.mark.anyio
 async def test_registered_callback_handlers_drive_participant_flow(
     tmp_path: Path,
 ) -> None:
@@ -486,79 +517,28 @@ async def test_registered_callback_handlers_drive_participant_flow(
     assert await storage.list_entries() == []
     assert bot.api.users.get.await_count == 2
     assert event.show_snackbar.await_count == 6
-    assert event.edit_message.await_count == 2
+    assert event.edit_message.await_count == 1
     event.send_message.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_callback_list_edits_the_originating_conversation_message(
-    tmp_path: Path,
-) -> None:
-    # Given: an in-scope list callback with distinct conversation and message IDs
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-    )
+async def test_list_and_help_use_canonical_message(tmp_path: Path) -> None:
+    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.add_user(1, "Alice")
+    await storage.start_new_collection(321)
     bot = _build_bot(storage, config)
     event = MagicMock(spec=MessageEvent)
     event.peer_id = config.chat_peer_id
-    event.conversation_message_id = 42
-    event.message_id = 999
     event.edit_message = AsyncMock()
-    event.send_message = AsyncMock()
     event.show_snackbar = AsyncMock()
-
-    # When: the participant requests the list through the inline button
-    await _callback_handlers(bot)["cb_list"](event)
-
-    # Then: VKBottle edits the event's conversation message, never a guessed ID
-    event.edit_message.assert_awaited_once_with(
-        message="Список участников:\n1. Alice",
-        keyboard=ANY,
-    )
-    bot.api.messages.edit.assert_not_called()
-    event.send_message.assert_not_awaited()
-    event.show_snackbar.assert_awaited_once_with("Список обновлён в сообщении бота.")
-
-
-@pytest.mark.anyio
-async def test_callback_list_replaces_message_once_when_edit_fails(
-    tmp_path: Path,
-) -> None:
-    # Given: an in-scope list callback whose event message is no longer editable
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-    )
-    storage = Storage(tmp_path / "participants.json")
-    bot = _build_bot(storage, config)
-    bot.api.messages.send = AsyncMock(return_value=321)
-    event = MagicMock(spec=MessageEvent)
-    event.peer_id = config.chat_peer_id
-    event.edit_message = AsyncMock(
-        side_effect=VKAPIError(error_msg="message is not editable"),
-    )
-    event.send_message = AsyncMock()
-    event.show_snackbar = AsyncMock()
-
-    # When: the participant requests the list through the inline button
-    await _callback_handlers(bot)["cb_list"](event)
-
-    # Then: exactly one replacement is sent and becomes the canonical status
-    event.edit_message.assert_awaited_once_with(
-        message="Пока никто не записался.",
-        keyboard=ANY,
-    )
-    bot.api.messages.send.assert_awaited_once_with(
-        peer_id=config.chat_peer_id,
-        message="Пока никто не записался.",
-        keyboard=ANY,
-        random_id=ANY,
-    )
-    event.send_message.assert_not_awaited()
-    assert await storage.status_message_id() == 321
+    handlers = _callback_handlers(bot)
+    await handlers["cb_list"](event)
+    await handlers["cb_help"](event)
+    bot.api.messages.edit.assert_not_awaited()
+    event.edit_message.assert_awaited_once()
+    assert "Участников: 0" in event.edit_message.await_args.kwargs["message"]
+    bot.api.messages.send.assert_not_called()
+    assert event.show_snackbar.await_count == 2
 
 
 @pytest.mark.anyio
@@ -589,13 +569,90 @@ async def test_callback_join_and_leave_refresh_the_canonical_status_message(
         call(
             peer_id=config.chat_peer_id,
             message_id=321,
-            message="Список участников:\n1. Alice",
+            conversation_message_id=None,
+            message="🏐 Запись открыта · Участников: 1\n\nСписок участников:\n1. Alice",
             keyboard=ANY,
         ),
         call(
             peer_id=config.chat_peer_id,
             message_id=321,
-            message="Пока никто не записался.",
+            conversation_message_id=None,
+            message="🏐 Запись открыта · Участников: 0\n\nПока никто не записался.",
             keyboard=ANY,
         ),
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fail_delete", [False, True])
+@pytest.mark.parametrize("cmid", [None, 24])
+async def test_temporary_reply_deletes_only_bot_message(
+    monkeypatch: pytest.MonkeyPatch, fail_delete: bool, cmid: int | None
+) -> None:
+    msg = MagicMock(spec=Message)
+    msg.peer_id = 2_000_000_001
+    msg.answer = AsyncMock(
+        return_value=SimpleNamespace(message_id=456, conversation_message_id=cmid)
+    )
+    msg.ctx_api.messages.delete = AsyncMock(
+        side_effect=VKAPIError(error_msg="denied") if fail_delete else None
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    await temporary_answer(msg, "Готово", keyboard="keyboard")
+    sleep.assert_awaited_once_with(10)
+    if cmid is None:
+        msg.ctx_api.messages.delete.assert_awaited_once_with(
+            message_ids=[456], delete_for_all=True
+        )
+    else:
+        msg.ctx_api.messages.delete.assert_awaited_once_with(
+            peer_id=msg.peer_id, cmids=[cmid], delete_for_all=True
+        )
+
+
+@pytest.mark.anyio
+async def test_list_persists_card_and_updates_it_by_conversation_id(
+    tmp_path: Path,
+) -> None:
+    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.start_new_collection(None)
+    await storage.set_status_message_id(0, conversation_message_id=24)
+    bot = _build_bot(storage, config)
+    bot.api.messages.delete = AsyncMock()
+    msg = MagicMock(spec=Message)
+    msg.peer_id = config.chat_peer_id
+    msg.answer = AsyncMock(
+        return_value=SimpleNamespace(message_id=0, conversation_message_id=30)
+    )
+    await _message_handlers(bot)["show_list"](msg)
+    assert "Участников: 0" in msg.answer.await_args.args[0]
+    bot.api.messages.delete.assert_awaited_once_with(
+        peer_id=config.chat_peer_id, cmids=[24], delete_for_all=True
+    )
+    assert await Storage(path).status_conversation_message_id() == 30
+    event = MagicMock(spec=MessageEvent)
+    event.peer_id = config.chat_peer_id
+    event.user_id = 1
+    event.show_snackbar = AsyncMock()
+    await _callback_handlers(bot)["cb_join"](event)
+    assert bot.api.messages.edit.await_args.kwargs["conversation_message_id"] == 30
+    assert "Участников: 1" in bot.api.messages.edit.await_args.kwargs["message"]
+    assert await Storage(path).status_conversation_message_id() == 30
+
+
+@pytest.mark.anyio
+async def test_failed_new_card_keeps_previous_card(tmp_path: Path) -> None:
+    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
+    storage = Storage(tmp_path / "participants.json")
+    await storage.set_status_message_id(0, conversation_message_id=24)
+    bot = _build_bot(storage, config)
+    msg = MagicMock(spec=Message)
+    msg.peer_id = config.chat_peer_id
+    msg.answer = AsyncMock(side_effect=OSError("offline"))
+    with pytest.raises(OSError, match="offline"):
+        await _message_handlers(bot)["show_list"](msg)
+    assert await storage.status_conversation_message_id() == 24
+    bot.api.messages.delete.assert_not_called()

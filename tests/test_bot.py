@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import secrets
 from unittest.mock import AsyncMock, MagicMock
@@ -11,11 +12,12 @@ from src.bot import (
     _admin_help_text,
     build_inline_keyboard,
     extract_friend_name,
-    format_entries,
     help_text,
+    parse_event_start,
     setup_handlers,
 )
 from src.config import Config
+from src.formatting import format_entries
 from src.storage import FriendEntry, Storage, UserEntry
 from vkbottle import GroupEventType
 from vkbottle.bot import Bot, Message, MessageEvent
@@ -123,6 +125,18 @@ def test_admin_help_text_contains_commands() -> None:
     assert "сбросить" in text
     assert "убрать" in text
     assert "удалить" in text
+    assert "создать событие" in text
+
+
+def test_parse_event_start_uses_documented_format() -> None:
+    assert parse_event_start("создать событие 22.09.2026 19:30") == (
+        datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+    )
+
+
+def test_parse_event_start_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError, match=r"ДД\.ММ\.ГГГГ"):
+        parse_event_start("создать событие завтра")
 
 
 @pytest.mark.anyio

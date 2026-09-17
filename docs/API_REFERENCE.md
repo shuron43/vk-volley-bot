@@ -14,10 +14,12 @@
 class Config(BaseSettings):
     vk_token: str
     chat_peer_id: int
-    collect_weekday: int = 2
-    collect_time: str = "10:00"
+    collect_weekday: int = 0
+    collect_time: str = "08:00"
+    event_weekday: int = 1
+    event_time: str = "19:30"
     remind_enabled: bool = True
-    remind_weekday: int = 0
+    remind_weekday: int = 1
     remind_time: str = "08:00"
     admin_vk_ids: tuple[int, ...] = ()  # env: ADMIN_VK_IDS_RAW
     data_path: str = "data.json"
@@ -27,8 +29,10 @@ class Config(BaseSettings):
 |------|-----|--------------|-----------|----------|
 | `vk_token` | `str` | — | обязательное | Токен сообщества VK |
 | `chat_peer_id` | `int` | — | обязательное, `>= 1` | `peer_id` группового чата |
-| `collect_weekday` | `int` | `2` | `0 <= v <= 6` | День недели сбора (0=Пн, 6=Вс) |
-| `collect_time` | `str` | `"10:00"` | формат `HH:MM`, часы 0–23, минуты 0–59 | Время анонса нового сбора |
+| `collect_weekday` | `int` | `0` | `0 <= v <= 6` | День еженедельного анонса |
+| `collect_time` | `str` | `"08:00"` | формат `HH:MM` | Время анонса и открытия записи |
+| `event_weekday` | `int` | `1` | `0 <= v <= 6` | День начала тренировки |
+| `event_time` | `str` | `"19:30"` | формат `HH:MM` | Время начала и закрытия записи |
 | `remind_enabled` | `bool` | `true` | — | Включить напоминание перед сбором |
 | `remind_weekday` | `int` | `0` | `0 <= v <= 6` | День недели напоминания |
 | `remind_time` | `str` | `"08:00"` | формат `HH:MM` | Время напоминания |
@@ -46,6 +50,12 @@ def collect_hour(self) -> int
 
 @property
 def collect_minute(self) -> int
+
+@property
+def event_hour(self) -> int
+
+@property
+def event_minute(self) -> int
 
 @property
 def remind_hour(self) -> int
@@ -66,7 +76,7 @@ def is_admin(self, vk_id: int) -> bool
 ### Валидаторы
 
 ```python
-@field_validator("collect_weekday", "remind_weekday")
+@field_validator("collect_weekday", "event_weekday", "remind_weekday")
 @classmethod
 def _validate_weekday(cls, v: int) -> int
 ```
@@ -74,7 +84,7 @@ def _validate_weekday(cls, v: int) -> int
 Выбрасывает `ValueError` если день недели вне диапазона `0–6`.
 
 ```python
-@field_validator("collect_time", "remind_time")
+@field_validator("collect_time", "event_time", "remind_time")
 @classmethod
 def _validate_time(cls, v: str) -> str
 ```
@@ -83,7 +93,8 @@ def _validate_time(cls, v: str) -> str
 
 `_parse_admin_vk_ids` разбирает `ADMIN_VK_IDS_RAW` в tuple положительных целых
 ID. `_validate_schedule_collision` запрещает включённому напоминанию совпадать
-с моментом сбора. `_validate_data_path` отклоняет путь с компонентом `..`.
+с анонсом или началом события. Анонс и начало также не могут совпадать.
+`_validate_data_path` отклоняет путь с компонентом `..`.
 
 ---
 
@@ -125,6 +136,8 @@ JSON-хранилище участников и состояния регист�
 | `status_message_id` | `int \| None` | ID канонического статусного сообщения бота (используется callback-хендлерами для `messages.edit`) |
 | `collection_id` | `int` | Номер сбора для проверки задержавшихся запросов регистрации |
 | `announcement_random_id` | `int \| None` | Сохранённый идентификатор отправки незавершённого анонса |
+| `event_starts_at` | `datetime \| None` | Точное локальное время начала и автоматического закрытия |
+| `event_source` | `"weekly" \| "manual" \| None` | Источник события |
 
 ### `Storage`
 
@@ -180,15 +193,39 @@ ID канонического статусного сообщения бота, 
 
 #### `async is_registration_open(self) -> bool`
 
-`True`, если `registration_state == "open"`. Это единственная проверка для всех попыток добавления участника.
+`True`, если `registration_state == "open"`. Используется для отображения и
+диагностики состояния. Пользовательские добавления получают токен текущего
+сбора через `active_collection()` и повторно сверяют его внутри `add_user()` или
+`add_friend()`.
 
 #### `async mark_opening(self) -> None`
 
 Переводит регистрацию в `opening`, сохраняя участников и ID статусного сообщения. Создаёт и сохраняет `announcement_random_id`, если его ещё нет. Повторный вызов сохраняет тот же ID. После перезапуска планировщик возобновляет открытие с этим идентификатором отправки.
 
+#### `async begin_event(self, event_starts_at: datetime, event_source: EventSource) -> bool`
+
+Атомарно начинает подготовку события и сохраняет его время. Возвращает `False`,
+если другое событие уже находится в `opening` или `open`; это основная защита
+от пересечения ручного и недельного окон.
+
 #### `async start_new_collection(self, status_message_id: int | None) -> None`
 
 Атомарно очищает `participants`, переводит регистрацию в `open`, сохраняет новый `status_message_id`, увеличивает `collection_id` и сбрасывает `announcement_random_id`. После успешной отправки анонса планировщик повторяет неудачное сохранение отдельно от отправки.
+
+#### `async activate_event(self, status_message_id, expected_start) -> None`
+
+Строгий вариант активации для планировщика: перед открытием повторно проверяет,
+что состояние всё ещё `opening` и время события не изменилось. Закрытое в
+параллельной задаче событие нельзя случайно открыть поздним ответом VK.
+
+#### `async close_registration(self) -> bool`
+
+Переводит активное событие в `closed`, сохраняя итоговых участников,
+`event_starts_at` и ID карточки. Повторный вызов возвращает `False`.
+
+#### `async event_details(self) -> tuple[datetime | None, EventSource | None]`
+
+Возвращает время и источник текущего либо последнего закрытого события.
 
 #### `async set_status_message_id(self, message_id: int | None) -> None`
 
@@ -200,7 +237,7 @@ ID канонического статусного сообщения бота, 
 
 #### `async clear(self) -> None`
 
-Очищает список и перезаписывает файл JSON с пустым массивом участников. Состояние регистрации и `status_message_id` сохраняются. Используется только админ-командой `очистить`/`сбросить`; **не вызывается планировщиком** — за это отвечает `start_new_collection()`.
+Очищает список и перезаписывает файл JSON с пустым массивом участников. Состояние регистрации и `status_message_id` сохраняются. Используется только админ-командой `очистить`/`сбросить`; планировщик открывает новый список через `activate_event()`.
 
 Все методы, изменяющие список, сохраняют полный JSON-снимок. Максимум — 100
 участников, максимальная длина имени — 100 символов; превышение лимита вызывает
@@ -271,7 +308,7 @@ ID канонического статусного сообщения бота, 
 1. Вызывает `join_user(msg.from_id)` (см. таблицу выше).
 2. Отправляет ответ через `msg.answer(..., keyboard=inline_keyboard)`.
 
-**Особенность:** зависит от VK API для резолва имени. Если VK API вернёт пустой список пользователей или `first_name` отсутствует — используется `"Unknown"`. `VKAPIError` перехватывается, пользователю отправляется сообщение о временной ошибке. При закрытой регистрации возвращается `Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь».`.
+**Особенность:** зависит от VK API для резолва имени. Если VK API вернёт пустой список пользователей или `first_name` отсутствует — используется `"Unknown"`. `VKAPIError` перехватывается, пользователю отправляется сообщение о временной ошибке. При закрытой регистрации возвращается `Запись закрыта. Дождись следующего анонса или нажми «Помощь».`.
 
 #### Хендлер `+` (bare_plus, guidance-only)
 
@@ -305,7 +342,7 @@ ID канонического статусного сообщения бота, 
 **Правило:** `@bot.on.message(RegexRule(r"^\+\s*(.+)$"))`
 
 1. Извлекает текст после `+` через `extract_friend_name()`.
-2. Вызывает `add_friend_by_name(name)` — внутри проверяется `active_collection()`. Если закрыто — `Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь».`. Перед сохранением повторно проверяются состояние и номер сбора под блокировкой.
+2. Вызывает `add_friend_by_name(name)` — внутри проверяется `active_collection()`. Если закрыто — `Запись закрыта. Дождись следующего анонса или нажми «Помощь».`. Перед сохранением повторно проверяются состояние и номер сбора под блокировкой.
 3. Иначе — `"{name} записан(а) как друг."`.
 
 Пустая форма не достигает этого обработчика: `+` и `+` с пробелами раньше
@@ -403,6 +440,13 @@ Payload (`join`, `leave`, `list`, `help`) составляют контракт 
 - Вызывает `storage.clear()`
 - Отвечает: `"Список участников очищен."`
 
+#### `admin_create_event` — `создать событие ДД.ММ.ГГГГ ЧЧ:ММ`
+
+- Проверяет права и разбирает локальное время через `parse_event_start`
+- Вызывает `open_manual_event(...)`, который запрещает прошедшее время,
+  активное событие и пересечение со следующим еженедельным анонсом
+- Немедленно публикует анонс; закрытие выполняет общий планировщик
+
 #### `admin_remove` — `RegexRule(r"^(?:убрать|удалить)\s+(.+)$")`
 
 - Проверяет права администратора
@@ -419,25 +463,31 @@ Payload (`join`, `leave`, `list`, `help`) составляют контракт 
 
 ## `src/scheduler.py`
 
-Еженедельный планировщик: анонс нового сбора и напоминание. Анонс защищён
-жизненным циклом регистрации (`mark_opening` → `_send_announcement` →
-`start_new_collection`), так что при сбое VK участники не теряются.
+Планировщик анонсов, напоминаний и автоматического закрытия. Открытие защищено
+цепочкой `begin_event` → `_send_announcement` → `activate_event`, а
+точное начало хранится на диске.
 
 ### `_next_target(now: datetime.datetime, weekday: int, hour: int, minute: int) -> datetime.datetime`
 
 Чистая функция. Вычисляет ближайший future datetime по заданному дню недели и времени. Если цель уже прошла сегодня — сдвигает на 7 дней вперёд.
 
-### `async _send_announcement(api: API, config: Config, inline_keyboard: str) -> int | None`
+### `async _send_announcement(api, config, inline_keyboard, event_starts_at, random_id=None) -> int | None`
 
-Отправляет еженедельный анонс через `api.messages.send(...)` с inline-клавиатурой. Возвращает ID отправленного сообщения (`int`) или `None`, если VK вернул значение, которое не является `int` (например, массив ошибки под нагрузкой).
+Отправляет анонс с датой начала и пояснением об автоматическом закрытии.
+Возвращает ID сообщения либо `None`.
 
 ### `async _send_reminder(api: API, config: Config, inline_keyboard: str, storage: Storage) -> None`
 
 Отправляет напоминание с текущим списком участников. **Не очищает** хранилище и не меняет состояние регистрации.
 
-### `def _pick_next_event(collect_target: datetime.datetime, remind_target: datetime.datetime | None) -> tuple[datetime.datetime, str]`
+### `def _pick_next_event(collect_target, remind_target, close_target=None) -> tuple[datetime, str]`
 
-Выбирает ближайшее событие из двух target'ов. Возвращает `(target, event_label)`, где `event_label` — `"collect"` или `"remind"`.
+Выбирает ближайший анонс, напоминание или закрытие.
+
+### `async open_manual_event(api, config, storage, event_starts_at, *, now=None) -> None`
+
+Открывает ручное событие сразу. Требует будущего времени раньше следующего
+еженедельного анонса и свободного жизненного цикла.
 
 ### `async _run_with_retry[T](label: str, operation: Callable[[], Awaitable[T]]) -> T`
 
@@ -445,31 +495,35 @@ Payload (`join`, `leave`, `list`, `help`) составляют контракт 
 
 ### `run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn`
 
-Бесконечный цикл с двумя событиями:
+Бесконечный цикл с тремя событиями:
 
 1. **Вычисление следующих целей:**
    - Берёт `now = datetime.datetime.now()` (локальное время сервера)
-   - Вычисляет `collect_target` — время следующего сбора
-   - Если `remind_enabled=True`, вычисляет `remind_target` — время напоминания
+   - Вычисляет `collect_target` — время следующего анонса
+   - Для `open` берёт сохранённый `event_starts_at` как `close_target`
+   - При открытой записи и `remind_enabled=True` вычисляет напоминание
    - Совпадающие включённые расписания невозможны: `Config` отклоняет их при старте
 
 2. **Выбор ближайшего события:**
-   - Вызывает `_pick_next_event(collect_target, remind_target)`
+   - Вызывает `_pick_next_event(collect_target, remind_target, close_target)`
 
 3. **Ожидание:**
    - `sleep_seconds = (target - now).total_seconds()`
    - `await anyio.sleep(sleep_seconds)`
 
 4. **Действие:**
-   - **Сбор** (`event == "collect"`):
-     1. `await storage.mark_opening()` — переводит регистрацию в `opening`, **сохраняя** участников и `status_message_id`. Этот шаг ровно один, и до успешной отправки список не очищается.
+   - **Анонс** (`event == "collect"`):
+     1. Вычисляет следующее начало из `EVENT_*` и вызывает `begin_event`.
      2. `message_id = await _run_with_retry("Weekly announcement", _send_announcement)` — повторяется каждые 5 минут при сбоях.
-     3. `await storage.start_new_collection(message_id)` — атомарно очищает участников, переводит регистрацию в `open` и сохраняет ID нового анонса как канонический статус.
+     3. `await storage.activate_event(message_id, event_starts_at)` — атомарно проверяет актуальность, очищает участников и переводит регистрацию в `open`.
+   - **Закрытие** (`event == "close"`): сохраняет `closed` и редактирует
+     существующую карточку без отправки нового сообщения.
    - **Напоминание** (`event == "remind"`): отправляет текущий список участников без касания состояния.
 
 5. **Обработка ошибок:**
    - Сбои `OSError`, `TimeoutError` или `VKAPIError` при отправке логируются, затем попытка повторяется через 5 минут. Для анонса используется сохранённый `random_id`. Состояние `opening` восстанавливается при старте через `_finish_opening()`. Ошибка сохранения после успешного анонса повторяет только активацию сбора.
-   - При успехе — переходит к шагу 1.
+   - При старте просроченные `opening`/`open` закрываются сразу; поздний анонс
+     для уже начавшегося события не отправляется.
 
 **Тип возвращаемого значения:** `NoReturn` — функция никогда не завершается нормально.
 
@@ -517,7 +571,7 @@ async def main() -> None:
 
 - `_entries`, `_registration_state` и `_status_message_id` всегда синхронизированы с файлом `_path` после успешной записи
 - Ошибка сохранения не публикует снимок-кандидат в живое состояние
-- После любого публичного метода (`add_*`, `remove_*`, `clear`, `mark_opening`, `start_new_collection`, `set_status_message_id`) файл актуален
+- После любого публичного метода (`add_*`, `remove_*`, `clear`, `begin_event`, `activate_event`, `close_registration`, `set_status_message_id`) файл актуален
 - `list_entries()` возвращает копию — изменение возвращённого списка не влияет на хранилище
 - `_load()` сохраняет `opening` и идентификатор отправки; планировщик возобновляет незавершённое открытие до ожидания расписания
 
@@ -545,7 +599,7 @@ async def main() -> None:
 
 1. **Участники не теряются при сбое анонса.** `mark_opening` сохраняет их до
    отправки, и `_load` сохраняет прерванное `opening` для восстановления.
-2. **Очистка и открытие происходят одним коммитом.** `start_new_collection`
+2. **Очистка и открытие происходят одним коммитом.** `activate_event`
    единственный метод, который и стирает список, и переключает состояние.
 3. **Callback-кнопки редактируют канонический статус.** Если редактирование
    не удалось, новая замена сохраняется через `set_status_message_id`, и

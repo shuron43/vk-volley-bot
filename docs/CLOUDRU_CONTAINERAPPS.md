@@ -120,8 +120,10 @@ VK бот пишет `data.json` при каждой записи/отписке
 |------------|----------|
 | `VK_TOKEN` | `vk1.a.xxx...` |
 | `CHAT_PEER_ID` | `2000000001` |
-| `COLLECT_WEEKDAY` | `2` |
-| `COLLECT_TIME` | `10:00` |
+| `COLLECT_WEEKDAY` | `0` |
+| `COLLECT_TIME` | `08:00` |
+| `EVENT_WEEKDAY` | `1` |
+| `EVENT_TIME` | `19:30` |
 | `DATA_PATH` | `/app/data/participants.json` |
 | `TZ` | `Europe/Moscow` |
 
@@ -264,7 +266,7 @@ Container Apps автоматически создаст новую **ревиз
 ### Scheduler не срабатывает
 
 - `TZ=Europe/Moscow` должен быть установлен как переменная окружения в Container Apps
-- Проверьте `COLLECT_WEEKDAY` (0–6) и `COLLECT_TIME` (HH:MM)
+- Проверьте `COLLECT_*` для анонса и `EVENT_*` для начала тренировки
 
 ### Нет доступа к VK API
 

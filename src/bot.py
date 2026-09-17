@@ -1,8 +1,8 @@
 """VK bot message handlers."""
 
 import asyncio
+import datetime
 import logging
-import secrets
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Final, TypeVar
@@ -12,17 +12,53 @@ from vkbottle.bot import Bot, Message, MessageEvent
 from vkbottle.dispatch.rules.base import PayloadRule, RegexRule
 
 from src.config import Config
-from src.formatting import format_entries, help_text
+from src.formatting import format_registration_card, help_text
 from src.keyboard import build_inline_keyboard
+from src.scheduler import open_manual_event
 from src.storage import Storage
 
 _LOGGER: Final = logging.getLogger(__name__)
 _EventT = TypeVar("_EventT", Message, MessageEvent)
 
 
+async def temporary_answer(msg: Message, message: str, *, keyboard: str) -> None:
+    """Show feedback briefly, then delete only the bot's own reply for everyone."""
+    sent = await msg.answer(message, keyboard=keyboard)
+    message_id = sent.message_id
+    cmid = sent.conversation_message_id
+    has_cmid = type(cmid) is int and cmid > 0
+    if not has_cmid and (type(message_id) is not int or message_id <= 0):
+        return
+    await asyncio.sleep(10)
+    try:
+        if type(cmid) is int and cmid > 0:
+            _ = await msg.ctx_api.messages.delete(
+                peer_id=msg.peer_id,
+                cmids=[cmid],
+                delete_for_all=True,
+            )
+        elif type(message_id) is int and message_id > 0:
+            _ = await msg.ctx_api.messages.delete(
+                message_ids=[message_id],
+                delete_for_all=True,
+            )
+    except (VKAPIError, OSError, TimeoutError):
+        _LOGGER.warning("Could not delete temporary bot reply %s", message_id)
+
+
 def extract_friend_name(text: str) -> str:
     """Extract and trim the name following a friend command sign."""
     return text[1:].strip()
+
+
+def parse_event_start(text: str) -> datetime.datetime:
+    """Parse the date and time from an administrator event command."""
+    value = text.removeprefix("создать событие").strip()
+    try:
+        return datetime.datetime.strptime(value, "%d.%m.%Y %H:%M")  # noqa: DTZ007
+    except ValueError as exc:
+        message = "Формат: создать событие ДД.ММ.ГГГГ ЧЧ:ММ"
+        raise ValueError(message) from exc
 
 
 def _admin_help_text() -> str:
@@ -31,6 +67,7 @@ def _admin_help_text() -> str:
         "Админ-команды:\n"
         "очистить / сбросить — очистить список участников\n"
         "убрать Имя / удалить Имя — удалить участника по имени\n"
+        "создать событие ДД.ММ.ГГГГ ЧЧ:ММ — открыть ручную запись\n"
         "админ помощь — показать эту справку"
     )
 
@@ -40,7 +77,7 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     inline_keyboard = build_inline_keyboard()
     status_lock = asyncio.Lock()
     registration_closed_message = (
-        "Запись ещё не открыта. Дождись анонса сбора или нажми «Помощь»."
+        "Запись закрыта. Дождись следующего анонса или нажми «Помощь»."
     )
     bare_plus_instruction = (
         "Чтобы записаться, нажми «Записаться» или напиши «записаться»"
@@ -97,38 +134,47 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
             return f"{name} убран(а) из списка."
         return "Такого друга не нашлось."
 
-    async def update_callback_message(event: MessageEvent, message: str) -> bool:
-        """Edit a callback message once, replacing it if VK rejects the edit."""
-        try:
-            _ = await event.edit_message(message=message, keyboard=inline_keyboard)
-        except VKAPIError:
-            _LOGGER.exception("Failed to edit callback message; sending replacement")
-            message_id = await bot.api.messages.send(
-                peer_id=config.chat_peer_id,
-                message=message,
-                keyboard=inline_keyboard,
-                random_id=secrets.randbits(31),
-            )
-            await storage.set_status_message_id(message_id)
-            return False
-        return True
-
     async def refresh_canonical_status() -> None:
         """Refresh the persisted registration status message when it is known."""
         async with status_lock:
             await edit_canonical_status()
 
+    async def card_text() -> str:
+        """Build a visible registration card, including the empty state."""
+        entries = await storage.list_entries()
+        state = await storage.registration_state()
+        event_starts_at, _ = await storage.event_details()
+        return format_registration_card(entries, state, event_starts_at)
+
+    async def delete_previous_card(message_id: int | None, cmid: int | None) -> None:
+        """Remove the previous bot card only after its replacement is durable."""
+        try:
+            if cmid is not None and cmid > 0:
+                _ = await bot.api.messages.delete(
+                    peer_id=config.chat_peer_id,
+                    cmids=[cmid],
+                    delete_for_all=True,
+                )
+            elif message_id is not None and message_id > 0:
+                _ = await bot.api.messages.delete(
+                    message_ids=[message_id],
+                    delete_for_all=True,
+                )
+        except (VKAPIError, OSError, TimeoutError):
+            _LOGGER.warning("Could not delete previous participant card")
+
     async def edit_canonical_status() -> None:
         """Read and publish the latest list while holding the status lock."""
-        status_message_id = await storage.status_message_id()
-        if status_message_id is None:
+        message_id = await storage.status_message_id()
+        cmid = await storage.status_conversation_message_id()
+        if not message_id and not cmid:
             return
-        entries = await storage.list_entries()
         try:
             _ = await bot.api.messages.edit(
                 peer_id=config.chat_peer_id,
-                message_id=status_message_id,
-                message=format_entries(entries),
+                message_id=message_id if not cmid else None,
+                conversation_message_id=cmid,
+                message=await card_text(),
                 keyboard=inline_keyboard,
             )
         except (VKAPIError, OSError, TimeoutError):
@@ -161,7 +207,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def sign_up(msg: Message) -> None:
         # Shares join_user with cb_join.
         response, _ = await join_user(msg.from_id)
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             response,
             keyboard=inline_keyboard,
         )
@@ -170,7 +217,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @bot.on.message(RegexRule(r"^\+\s+$"))
     @target_peer_only
     async def bare_plus(msg: Message) -> None:
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             bare_plus_message,
             keyboard=inline_keyboard,
         )
@@ -180,7 +228,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def sign_off(msg: Message) -> None:
         # Shares leave_user with cb_leave.
         response, _ = await leave_user(msg.from_id)
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             response,
             keyboard=inline_keyboard,
         )
@@ -190,12 +239,14 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def add_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
         if not name:
-            _ = await msg.answer(
+            await temporary_answer(
+                msg,
                 "Укажи имя друга: + Имя",
                 keyboard=inline_keyboard,
             )
             return
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             await add_friend_by_name(name),
             keyboard=inline_keyboard,
         )
@@ -204,7 +255,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def remove_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             await remove_friend_by_name(name),
             keyboard=inline_keyboard,
         )
@@ -212,18 +264,25 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @bot.on.message(text=["список", "участники", "кто идёт"])
     @target_peer_only
     async def show_list(msg: Message) -> None:
-        # Duplicates cb_list — keep in sync.
-        entries = await storage.list_entries()
-        _LOGGER.debug("List requested, %d entries", len(entries))
-        _ = await msg.answer(
-            format_entries(entries),
-            keyboard=inline_keyboard,
-        )
+        async with status_lock:
+            old_id = await storage.status_message_id()
+            old_cmid = await storage.status_conversation_message_id()
+            sent = await msg.answer(await card_text(), keyboard=inline_keyboard)
+            message_id = sent.message_id if type(sent.message_id) is int else None
+            cmid = sent.conversation_message_id
+            cmid = cmid if type(cmid) is int else None
+            if not message_id and not cmid:
+                return
+            await storage.set_status_message_id(
+                message_id, conversation_message_id=cmid
+            )
+            if (old_id, old_cmid) != (message_id, cmid):
+                await delete_previous_card(old_id, old_cmid)
 
     @bot.on.message(text=["?", "help", "помощь", "команды"])
     @target_peer_only
     async def help_cmd(msg: Message) -> None:
-        _ = await msg.answer(help_text(), keyboard=inline_keyboard)
+        await temporary_answer(msg, help_text(), keyboard=inline_keyboard)
 
     # --- Callback handlers for inline keyboard ---
 
@@ -256,12 +315,16 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_list(event: MessageEvent) -> None:
-        # Duplicates show_list — keep in sync.
         async with status_lock:
-            entries = await storage.list_entries()
-            updated = await update_callback_message(event, format_entries(entries))
-        if updated:
-            _ = await event.show_snackbar("Список обновлён в сообщении бота.")
+            try:
+                _ = await event.edit_message(
+                    message=await card_text(),
+                    keyboard=inline_keyboard,
+                )
+            except (VKAPIError, OSError, TimeoutError):
+                _ = await event.show_snackbar("Напиши список — покажу новую карточку.")
+                return
+        _ = await event.show_snackbar("Участники показаны в этом сообщении.")
 
     @bot.on.raw_event(
         GroupEventType.MESSAGE_EVENT,
@@ -270,19 +333,43 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_help(event: MessageEvent) -> None:
-        async with status_lock:
-            updated = await update_callback_message(event, help_text(compact=True))
-        if updated:
-            _ = await event.show_snackbar("Справка обновлена.")
+        _ = await event.show_snackbar(
+            "Запись — кнопкой; друг: + Имя; выход: -; убрать: - Имя. Справка: помощь."
+        )
 
     # --- Admin handlers ---
+
+    @bot.on.message(RegexRule(r"^создать событие(?:\s+.*)?$"))
+    @target_peer_only
+    async def admin_create_event(msg: Message) -> None:
+        if not config.is_admin(msg.from_id):
+            _LOGGER.warning("Unauthorized create_event attempt from %s", msg.from_id)
+            await temporary_answer(
+                msg,
+                "Только администраторы могут использовать эту команду.",
+                keyboard=inline_keyboard,
+            )
+            return
+        try:
+            event_starts_at = parse_event_start(msg.text or "")
+            await open_manual_event(bot.api, config, storage, event_starts_at)
+        except ValueError as exc:
+            await temporary_answer(msg, str(exc), keyboard=inline_keyboard)
+            return
+        _LOGGER.info("Manual event created by admin %s", msg.from_id)
+        await temporary_answer(
+            msg,
+            "Событие создано, запись открыта до начала.",
+            keyboard=inline_keyboard,
+        )
 
     @bot.on.message(text=["очистить", "сбросить"])
     @target_peer_only
     async def admin_clear(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized clear attempt from %s", msg.from_id)
-            _ = await msg.answer(
+            await temporary_answer(
+                msg,
                 "Только администраторы могут использовать эту команду.",
                 keyboard=inline_keyboard,
             )
@@ -290,7 +377,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         await storage.clear()
         await refresh_canonical_status()
         _LOGGER.info("List cleared by admin %s", msg.from_id)
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             "Список участников очищен.",
             keyboard=inline_keyboard,
         )
@@ -300,7 +388,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def admin_remove(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized remove attempt from %s", msg.from_id)
-            _ = await msg.answer(
+            await temporary_answer(
+                msg,
                 "Только администраторы могут использовать эту команду.",
                 keyboard=inline_keyboard,
             )
@@ -309,12 +398,14 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         if await storage.remove_by_name(name):
             await refresh_canonical_status()
             _LOGGER.info("Admin %s removed %s", msg.from_id, name)
-            _ = await msg.answer(
+            await temporary_answer(
+                msg,
                 f"{name} убран(а) из списка.",
                 keyboard=inline_keyboard,
             )
         else:
-            _ = await msg.answer(
+            await temporary_answer(
+                msg,
                 "Такого участника не нашлось.",
                 keyboard=inline_keyboard,
             )
@@ -324,12 +415,14 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def admin_help(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized admin_help attempt from %s", msg.from_id)
-            _ = await msg.answer(
+            await temporary_answer(
+                msg,
                 "Только администраторы могут использовать эту команду.",
                 keyboard=inline_keyboard,
             )
             return
-        _ = await msg.answer(
+        await temporary_answer(
+            msg,
             _admin_help_text(),
             keyboard=inline_keyboard,
         )

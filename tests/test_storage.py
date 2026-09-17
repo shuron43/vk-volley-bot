@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, assert_never
@@ -139,6 +140,49 @@ async def test_storage_starts_new_collection_as_open(tmp_path: Path) -> None:
     assert await storage.registration_state() == "open"
     assert await storage.is_registration_open() is True
     assert await storage.status_message_id() == 123
+
+
+@pytest.mark.anyio
+async def test_event_lifecycle_persists_start_and_closes_without_clearing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    starts_at = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "weekly") is True
+    await storage.start_new_collection(123)
+    await storage.add_friend("Bob")
+
+    assert await storage.close_registration() is True
+
+    restored = Storage(path)
+    assert await restored.registration_state() == "closed"
+    assert await restored.event_details() == (starts_at, "weekly")
+    assert [entry.name for entry in await restored.list_entries()] == ["Bob"]
+    assert await restored.close_registration() is False
+
+
+@pytest.mark.anyio
+async def test_begin_event_rejects_overlapping_registration(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    first = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+    second = datetime.datetime(2026, 9, 23, 20, 0)  # noqa: DTZ001
+    assert await storage.begin_event(first, "manual") is True
+    assert await storage.begin_event(second, "weekly") is False
+    await storage.start_new_collection(1)
+    assert await storage.begin_event(second, "weekly") is False
+    assert await storage.event_details() == (first, "manual")
+
+
+@pytest.mark.anyio
+async def test_late_activation_cannot_reopen_closed_event(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    starts_at = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "manual")
+    await storage.close_registration()
+    with pytest.raises(ValueError, match="сбор изменился"):
+        await storage.activate_event(123, starts_at)
+    assert await storage.registration_state() == "closed"
 
 
 @pytest.mark.anyio

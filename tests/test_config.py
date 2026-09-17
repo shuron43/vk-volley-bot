@@ -61,6 +61,31 @@ def test_config_collect_time_properties(monkeypatch: pytest.MonkeyPatch) -> None
     assert config.collect_minute == 30
 
 
+def test_config_event_defaults_and_time_properties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_base_env(monkeypatch)
+    monkeypatch.delenv("EVENT_WEEKDAY", raising=False)
+    monkeypatch.delenv("EVENT_TIME", raising=False)
+    config = Config()
+    assert config.event_weekday == 1
+    assert config.event_time == "19:30"
+    assert config.event_hour == 19
+    assert config.event_minute == 30
+
+
+def test_config_rejects_event_at_announcement_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("COLLECT_WEEKDAY", "1")
+    monkeypatch.setenv("COLLECT_TIME", "19:30")
+    monkeypatch.setenv("EVENT_WEEKDAY", "1")
+    monkeypatch.setenv("EVENT_TIME", "19:30")
+    with pytest.raises(ValidationError, match="different moments"):
+        Config()
+
+
 @pytest.mark.parametrize("bad_peer_id", ["0", "-1", "-2000000001"])
 def test_config_rejects_non_positive_chat_peer_id(
     monkeypatch: pytest.MonkeyPatch,
@@ -124,6 +149,7 @@ def test_config_accepts_valid_remind_weekday(
     """Config accepts valid weekday values for remind_weekday."""
     _set_base_env(monkeypatch)
     monkeypatch.setenv("REMIND_WEEKDAY", str(remind_weekday))
+    monkeypatch.setenv("REMIND_TIME", "09:00")
 
     config = Config()
     assert config.remind_weekday == remind_weekday
@@ -156,7 +182,7 @@ def test_config_remind_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_base_env(monkeypatch)
     config = Config()
     assert config.remind_enabled is True
-    assert config.remind_weekday == 0
+    assert config.remind_weekday == 1
     assert config.remind_time == "08:00"
     assert config.remind_hour == 8
     assert config.remind_minute == 0

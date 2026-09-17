@@ -4,4 +4,7 @@ __pycache__/
 *.pyc
 data.json
 .ruff_cache/
+.pytest_cache/
+.coverage
+.vkbottle/
 .omo/

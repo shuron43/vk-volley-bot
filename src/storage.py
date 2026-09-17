@@ -1,6 +1,7 @@
 """JSON-backed storage for event participants."""
 
 import asyncio
+import datetime
 import logging
 import secrets
 from pathlib import Path
@@ -36,6 +37,7 @@ class FriendEntry(BaseModel):
 
 
 Entry = UserEntry | FriendEntry
+EventSource = Literal["weekly", "manual"]
 
 
 class _StorageData(BaseModel):
@@ -43,8 +45,11 @@ class _StorageData(BaseModel):
     participants: tuple[Annotated[Entry, Field(discriminator="kind")], ...]
     registration_state: Literal["closed", "opening", "open"] = "closed"
     status_message_id: int | None = None
+    status_conversation_message_id: int | None = None
     collection_id: int = 0
     announcement_random_id: int | None = None
+    event_starts_at: datetime.datetime | None = None
+    event_source: EventSource | None = None
 
 
 class Storage:
@@ -56,8 +61,11 @@ class Storage:
         self._entries: list[Entry] = []
         self._registration_state: Literal["closed", "opening", "open"] = "closed"
         self._status_message_id: int | None = None
+        self._status_conversation_message_id: int | None = None
         self._collection_id: int = 0
         self._announcement_random_id: int | None = None
+        self._event_starts_at: datetime.datetime | None = None
+        self._event_source: EventSource | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._load()
 
@@ -71,6 +79,9 @@ class Storage:
         self._collection_id = data.collection_id
         self._announcement_random_id = data.announcement_random_id
         self._status_message_id = data.status_message_id
+        self._status_conversation_message_id = data.status_conversation_message_id
+        self._event_starts_at = data.event_starts_at
+        self._event_source = data.event_source
         _LOGGER.info("Loaded %d entries from %s", len(self._entries), self._path)
 
     async def _save(self, data: _StorageData) -> None:
@@ -92,8 +103,11 @@ class Storage:
         self._entries = list(data.participants)
         self._registration_state = data.registration_state
         self._status_message_id = data.status_message_id
+        self._status_conversation_message_id = data.status_conversation_message_id
         self._collection_id = data.collection_id
         self._announcement_random_id = data.announcement_random_id
+        self._event_starts_at = data.event_starts_at
+        self._event_source = data.event_source
 
     async def _commit_entries(self, entries: list[Entry]) -> None:
         await self._commit(
@@ -101,8 +115,11 @@ class Storage:
                 participants=tuple(entries),
                 registration_state=self._registration_state,
                 status_message_id=self._status_message_id,
+                status_conversation_message_id=self._status_conversation_message_id,
                 collection_id=self._collection_id,
                 announcement_random_id=self._announcement_random_id,
+                event_starts_at=self._event_starts_at,
+                event_source=self._event_source,
             )
         )
 
@@ -175,7 +192,16 @@ class Storage:
         async with self._lock:
             return self._status_message_id
 
-    async def mark_opening(self) -> None:
+    async def status_conversation_message_id(self) -> int | None:
+        """Return the canonical card identifier inside the conversation."""
+        async with self._lock:
+            return self._status_conversation_message_id
+
+    async def mark_opening(
+        self,
+        event_starts_at: datetime.datetime | None = None,
+        event_source: EventSource | None = None,
+    ) -> None:
         """Persist that a new collection is being prepared."""
         async with self._lock:
             await self._commit(
@@ -183,13 +209,39 @@ class Storage:
                     participants=tuple(self._entries),
                     registration_state="opening",
                     status_message_id=self._status_message_id,
+                    status_conversation_message_id=self._status_conversation_message_id,
                     collection_id=self._collection_id,
                     announcement_random_id=(
                         self._announcement_random_id
                         or secrets.randbelow(2_147_483_646) + 1
                     ),
+                    event_starts_at=event_starts_at or self._event_starts_at,
+                    event_source=event_source or self._event_source,
                 )
             )
+
+    async def begin_event(
+        self, event_starts_at: datetime.datetime, event_source: EventSource
+    ) -> bool:
+        """Start preparing an event unless another registration is active."""
+        async with self._lock:
+            if self._registration_state in {"opening", "open"}:
+                return False
+            await self._commit(
+                _StorageData(
+                    participants=tuple(self._entries),
+                    registration_state="opening",
+                    status_message_id=self._status_message_id,
+                    status_conversation_message_id=(
+                        self._status_conversation_message_id
+                    ),
+                    collection_id=self._collection_id,
+                    announcement_random_id=secrets.randbelow(2_147_483_646) + 1,
+                    event_starts_at=event_starts_at,
+                    event_source=event_source,
+                )
+            )
+            return True
 
     async def start_new_collection(self, status_message_id: int | None) -> None:
         """Atomically clear participants and open a new collection."""
@@ -199,11 +251,59 @@ class Storage:
                     participants=(),
                     registration_state="open",
                     status_message_id=status_message_id,
+                    status_conversation_message_id=None,
                     collection_id=self._collection_id + 1,
+                    event_starts_at=self._event_starts_at,
+                    event_source=self._event_source,
                 )
             )
 
-    async def set_status_message_id(self, message_id: int | None) -> None:
+    async def activate_event(
+        self,
+        status_message_id: int | None,
+        expected_start: datetime.datetime,
+    ) -> None:
+        """Activate the pending event only if it is still current."""
+        async with self._lock:
+            if (
+                self._registration_state != "opening"
+                or self._event_starts_at != expected_start
+            ):
+                raise ValueError(_REGISTRATION_CHANGED_MSG)
+            await self._commit(
+                _StorageData(
+                    participants=(),
+                    registration_state="open",
+                    status_message_id=status_message_id,
+                    collection_id=self._collection_id + 1,
+                    event_starts_at=self._event_starts_at,
+                    event_source=self._event_source,
+                )
+            )
+
+    async def close_registration(self) -> bool:
+        """Close the current event without discarding its final participant list."""
+        async with self._lock:
+            if self._registration_state == "closed":
+                return False
+            await self._commit(
+                _StorageData(
+                    participants=tuple(self._entries),
+                    registration_state="closed",
+                    status_message_id=self._status_message_id,
+                    status_conversation_message_id=(
+                        self._status_conversation_message_id
+                    ),
+                    collection_id=self._collection_id,
+                    event_starts_at=self._event_starts_at,
+                    event_source=self._event_source,
+                )
+            )
+            return True
+
+    async def set_status_message_id(
+        self, message_id: int | None, *, conversation_message_id: int | None = None
+    ) -> None:
         """Persist the message identifier for the current registration status."""
         async with self._lock:
             await self._commit(
@@ -211,8 +311,11 @@ class Storage:
                     participants=tuple(self._entries),
                     registration_state=self._registration_state,
                     status_message_id=message_id,
+                    status_conversation_message_id=conversation_message_id,
                     collection_id=self._collection_id,
                     announcement_random_id=self._announcement_random_id,
+                    event_starts_at=self._event_starts_at,
+                    event_source=self._event_source,
                 )
             )
 
@@ -230,6 +333,13 @@ class Storage:
         """Return the durable identifier of the pending announcement."""
         async with self._lock:
             return self._announcement_random_id
+
+    async def event_details(
+        self,
+    ) -> tuple[datetime.datetime | None, EventSource | None]:
+        """Return the current or most recently closed event metadata."""
+        async with self._lock:
+            return self._event_starts_at, self._event_source
 
     def _check_collection(self, expected_collection: int | None) -> None:
         if expected_collection is not None and (

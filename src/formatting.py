@@ -1,12 +1,13 @@
 """Formatting helpers for bot responses."""
 
+import datetime
 from typing import Final, assert_never
 
 from src.storage import Entry, FriendEntry, UserEntry
 
 _MAX_NAME_LENGTH: Final = 100
 _HELP_TEXT: Final = (
-    "Запись открывается после анонса сбора.\n"
+    "Запись открывается после анонса и закрывается в момент начала события.\n"
     "Для себя — «записаться» или кнопка «✅ Записаться».\n"
     "Чтобы отписаться — «отписаться» или кнопка «↩️ Отписаться».\n"
     "`+` без имени подскажет, как записаться, но не добавит вас.\n"
@@ -14,6 +15,15 @@ _HELP_TEXT: Final = (
     "- Имя — убрать друга.\n"
     "📋 список — кто идёт.\n"
     "❓ ? — помощь"
+)
+_WEEKDAYS: Final = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
 )
 
 
@@ -38,3 +48,26 @@ def help_text(*, compact: bool = False) -> str:
     """Return lifecycle-aware help for text and callback messages."""
     _ = compact
     return _HELP_TEXT
+
+
+def format_event_start(value: datetime.datetime) -> str:
+    """Format a local event start for chat messages."""
+    return f"{_WEEKDAYS[value.weekday()]}, {value:%d.%m.%Y в %H:%M}"
+
+
+def format_registration_card(
+    entries: list[Entry],
+    state: str,
+    event_starts_at: datetime.datetime | None,
+) -> str:
+    """Build the canonical registration card."""
+    label = "Запись открыта" if state == "open" else "Запись закрыта"
+    event_line = (
+        f"\n🗓 Начало: {format_event_start(event_starts_at)}"
+        if event_starts_at is not None
+        else ""
+    )
+    return (
+        f"🏐 {label} · Участников: {len(entries)}{event_line}\n\n"
+        f"{format_entries(entries)}"
+    )

@@ -37,6 +37,9 @@ def config() -> Config:
         chat_peer_id=2_000_000_001,
         collect_weekday=0,
         collect_time="10:00",
+        event_weekday=0,
+        event_time="11:00",
+        remind_enabled=False,
     )
 
 
@@ -86,6 +89,21 @@ def test_next_target_returns_upcoming_configured_time(
 
     # Then: it returns the next occurrence, never an elapsed time
     assert target == expected
+
+
+def test_weekly_event_start_follows_announcement() -> None:
+    config = Config(
+        vk_token=secrets.token_urlsafe(),
+        chat_peer_id=2_000_000_001,
+        collect_weekday=0,
+        collect_time="08:00",
+        event_weekday=1,
+        event_time="19:30",
+        remind_enabled=False,
+    )
+    announcement = datetime.datetime(2026, 9, 21, 8, 0)  # noqa: DTZ001
+    expected = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+    assert scheduler._weekly_event_after(announcement, config) == expected
 
 
 @pytest.mark.parametrize(
@@ -143,7 +161,7 @@ async def test_send_announcement_returns_message_id_when_available(
     sent = api.messages.send.await_args.kwargs
     assert sent["peer_id"] == config.chat_peer_id
     assert sent["keyboard"] == "keyboard"
-    assert sent["message"].startswith("🏐 Сбор на волейбол!")
+    assert sent["message"].startswith("🏐 Запись на волейбол открыта!")
     assert message_id == expected_message_id
 
 
@@ -278,9 +296,17 @@ async def test_scheduler_starts_new_collection_once_when_announcement_is_retried
     api.messages.send = AsyncMock(side_effect=[OSError("VK unavailable"), 1])
     storage = MagicMock(spec=Storage)
     storage.registration_state = AsyncMock(return_value="closed")
+    storage.event_details = AsyncMock(
+        return_value=(
+            datetime.datetime(2024, 1, 1, 11, 0, tzinfo=datetime.UTC),
+            "weekly",
+        )
+    )
     storage.announcement_random_id = AsyncMock(return_value=42)
+    storage.begin_event = AsyncMock(return_value=True)
     storage.mark_opening = AsyncMock()
     storage.start_new_collection = AsyncMock()
+    storage.activate_event = AsyncMock()
     storage.clear = AsyncMock()
     sleep_durations: list[float] = []
 
@@ -301,8 +327,14 @@ async def test_scheduler_starts_new_collection_once_when_announcement_is_retried
         await scheduler.run_scheduler(api, config, storage)
 
     # Then: the opening transition is attempted once and collection starts once
-    storage.mark_opening.assert_awaited_once_with()
-    storage.start_new_collection.assert_awaited_once_with(1)
+    storage.begin_event.assert_awaited_once_with(
+        datetime.datetime(2024, 1, 1, 11, 0, tzinfo=datetime.UTC), "weekly"
+    )
+    storage.mark_opening.assert_not_awaited()
+    storage.activate_event.assert_awaited_once_with(
+        1, datetime.datetime(2024, 1, 1, 11, 0, tzinfo=datetime.UTC)
+    )
+    storage.start_new_collection.assert_not_awaited()
     storage.clear.assert_not_awaited()
 
 
@@ -336,18 +368,20 @@ async def test_activation_retry_does_not_resend_announcement(
 ) -> None:
     storage = Storage(tmp_path / "participants.json")
     await storage.mark_opening()
-    activate = storage.start_new_collection
+    activate = storage.activate_event
     attempts = 0
 
-    async def fail_once(message_id: int | None) -> None:
+    async def fail_once(
+        message_id: int | None, expected_start: datetime.datetime
+    ) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             message = "disk unavailable"
             raise OSError(message)
-        await activate(message_id)
+        await activate(message_id, expected_start)
 
-    monkeypatch.setattr(storage, "start_new_collection", fail_once)
+    monkeypatch.setattr(storage, "activate_event", fail_once)
     monkeypatch.setattr(scheduler.anyio, "sleep", AsyncMock())
     api = MagicMock()
     api.messages.send = AsyncMock(return_value=123)
@@ -355,3 +389,106 @@ async def test_activation_retry_does_not_resend_announcement(
     api.messages.send.assert_awaited_once()
     assert attempts == 2
     assert await storage.is_registration_open()
+
+
+@pytest.mark.anyio
+async def test_scheduler_closes_registration_at_event_start(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    starts_at = datetime.datetime(2024, 1, 1, 9, 0, tzinfo=datetime.UTC)
+    assert await storage.begin_event(starts_at, "weekly")
+    await storage.start_new_collection(123)
+    await storage.add_friend("Bob")
+    api = MagicMock()
+    api.messages.edit = AsyncMock()
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
+    )
+    monkeypatch.setattr(
+        scheduler.anyio, "sleep", AsyncMock(side_effect=StopSchedulerError)
+    )
+
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(api, config, storage)
+
+    assert await storage.registration_state() == "closed"
+    assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
+    assert "Запись закрыта" in api.messages.edit.await_args.kwargs["message"]
+
+
+@pytest.mark.anyio
+async def test_expired_opening_closes_after_restart_without_late_announcement(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    starts_at = datetime.datetime(2024, 1, 1, 8, 0, tzinfo=datetime.UTC)
+    assert await storage.begin_event(starts_at, "manual")
+    restored = Storage(tmp_path / "participants.json")
+    api = MagicMock()
+    api.messages.send = AsyncMock()
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
+    )
+    monkeypatch.setattr(
+        scheduler.anyio, "sleep", AsyncMock(side_effect=StopSchedulerError)
+    )
+
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(api, config, restored)
+
+    assert await restored.registration_state() == "closed"
+    api.messages.send.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_manual_event_opens_now_and_must_end_before_weekly_announcement(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    now = datetime.datetime(2024, 1, 1, 9, 0, tzinfo=datetime.UTC)
+    storage = Storage(tmp_path / "participants.json")
+    api = MagicMock()
+    api.messages.send = AsyncMock(return_value=321)
+    starts_at = now + datetime.timedelta(minutes=30)
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
+    )
+
+    await scheduler.open_manual_event(api, config, storage, starts_at, now=now)
+
+    assert await storage.registration_state() == "open"
+    assert await storage.event_details() == (starts_at, "manual")
+    assert "01.01.2024 в 09:30" in api.messages.send.await_args.kwargs["message"]
+
+    await storage.close_registration()
+    next_announcement = datetime.datetime(2024, 1, 8, 10, 0, tzinfo=datetime.UTC)
+    with pytest.raises(ValueError, match="пересекается"):
+        await scheduler.open_manual_event(
+            api, config, storage, next_announcement, now=now
+        )
+
+
+@pytest.mark.anyio
+async def test_manual_event_rejects_active_registration(
+    config: Config, tmp_path: Path
+) -> None:
+    now = datetime.datetime(2024, 1, 1, 9, 0, tzinfo=datetime.UTC)
+    storage = Storage(tmp_path / "participants.json")
+    assert await storage.begin_event(now + datetime.timedelta(minutes=15), "weekly")
+    api = MagicMock()
+    api.messages.send = AsyncMock()
+    with pytest.raises(ValueError, match="активное событие"):
+        await scheduler.open_manual_event(
+            api,
+            config,
+            storage,
+            now + datetime.timedelta(minutes=30),
+            now=now,
+        )
+    api.messages.send.assert_not_awaited()

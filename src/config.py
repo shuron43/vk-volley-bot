@@ -8,12 +8,12 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _MAX_WEEKDAY: Final = 6
 _WEEKDAY_ERROR_MSG = "Weekday must be between 0 (Monday) and 6 (Sunday)"
-_COLLECT_TIME_ERROR_MSG = "collect_time must be HH:MM with hour 00-23 and minute 00-59"
+_TIME_ERROR_MSG = "schedule time must be HH:MM with hour 00-23 and minute 00-59"
 _MAX_HOUR: Final = 23
 _MAX_MINUTE: Final = 59
 _DATA_PATH_ERROR_MSG = "data_path must not contain path traversal"
 _SCHEDULE_COLLISION_ERROR_MSG = (
-    "remind_time must not equal collect_time on the same weekday"
+    "remind_time and weekly schedule events must use different moments"
 )
 _ADMIN_IDS_ERROR_MSG = "admin_vk_ids must be comma-separated positive integers"
 _AdminVkId = Annotated[int, Field(gt=0)]
@@ -36,19 +36,27 @@ class Config(BaseSettings):
         description="VK chat peer_id where the bot operates",
     )
     collect_weekday: int = Field(
-        default=2,
-        description="Weekday to start collection (0=Monday, 6=Sunday)",
+        default=0,
+        description="Weekday to announce the weekly event (0=Monday, 6=Sunday)",
     )
     collect_time: str = Field(
-        default="10:00",
-        description="Local time to announce collection HH:MM",
+        default="08:00",
+        description="Local time to announce and open registration HH:MM",
+    )
+    event_weekday: int = Field(
+        default=1,
+        description="Weekday when the weekly event starts (0=Monday, 6=Sunday)",
+    )
+    event_time: str = Field(
+        default="19:30",
+        description="Local weekly event start and registration close time HH:MM",
     )
     remind_enabled: bool = Field(
         default=True,
         description="Send a reminder message on a fixed weekday before collection",
     )
     remind_weekday: int = Field(
-        default=0,
+        default=1,
         description="Weekday for reminder (0=Monday, 6=Sunday)",
     )
     remind_time: str = Field(
@@ -86,6 +94,16 @@ class Config(BaseSettings):
         return int(self.remind_time.split(":")[0])
 
     @property
+    def event_hour(self) -> int:
+        """Hour component of ``event_time`` (0-23)."""
+        return int(self.event_time.split(":")[0])
+
+    @property
+    def event_minute(self) -> int:
+        """Minute component of ``event_time`` (0-59)."""
+        return int(self.event_time.split(":")[1])
+
+    @property
     def remind_minute(self) -> int:
         """Minute component of ``remind_time`` (0-59)."""
         return int(self.remind_time.split(":")[1])
@@ -108,13 +126,10 @@ class Config(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_schedule_collision(self) -> Self:
-        if self.remind_enabled and (
-            self.collect_weekday,
-            self.collect_time,
-        ) == (
-            self.remind_weekday,
-            self.remind_time,
-        ):
+        collect = (self.collect_weekday, self.collect_time)
+        event = (self.event_weekday, self.event_time)
+        reminder = (self.remind_weekday, self.remind_time)
+        if collect == event or (self.remind_enabled and reminder in {collect, event}):
             raise ValueError(_SCHEDULE_COLLISION_ERROR_MSG)
         return self
 
@@ -125,29 +140,29 @@ class Config(BaseSettings):
             raise ValueError(_DATA_PATH_ERROR_MSG)
         return v
 
-    @field_validator("collect_weekday", "remind_weekday")
+    @field_validator("collect_weekday", "event_weekday", "remind_weekday")
     @classmethod
     def _validate_weekday(cls, v: int) -> int:
         if not 0 <= v <= _MAX_WEEKDAY:
             raise ValueError(_WEEKDAY_ERROR_MSG)
         return v
 
-    @field_validator("collect_time", "remind_time")
+    @field_validator("collect_time", "event_time", "remind_time")
     @classmethod
     def _validate_time(cls, v: str) -> str:
         if v.count(":") != 1:
-            raise ValueError(_COLLECT_TIME_ERROR_MSG)
+            raise ValueError(_TIME_ERROR_MSG)
 
         parts = v.split(":")
         hour_text, minute_text = parts
         if len(hour_text) != 2 or len(minute_text) != 2:  # noqa: PLR2004
-            raise ValueError(_COLLECT_TIME_ERROR_MSG)
+            raise ValueError(_TIME_ERROR_MSG)
         if not hour_text.isdigit() or not minute_text.isdigit():
-            raise ValueError(_COLLECT_TIME_ERROR_MSG)
+            raise ValueError(_TIME_ERROR_MSG)
 
         hour = int(hour_text)
         minute = int(minute_text)
         if not 0 <= hour <= _MAX_HOUR or not 0 <= minute <= _MAX_MINUTE:
-            raise ValueError(_COLLECT_TIME_ERROR_MSG)
+            raise ValueError(_TIME_ERROR_MSG)
 
         return v
