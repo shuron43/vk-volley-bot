@@ -11,6 +11,7 @@
 | [CONFIGURATION.md](CONFIGURATION.md) | Переменные окружения, получение токена VK, настройка планировщика, часовые пояса |
 | [BOT_COMMANDS.md](BOT_COMMANDS.md) | Список команд бота с примерами диалогов и сценариями |
 | [TESTING.md](TESTING.md) | Проверка работоспособности: автотесты, локальный запуск, ручная проверка в VK, Docker |
+| [FUTURE_CHANGES.md](FUTURE_CHANGES.md) | План исправления автозакрытия и перехода на одну карточку события |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Инструкции по деплою: Docker (`docker compose up -d`), systemd, VPS, облачные платформы |
 | [CLOUDRU.md](CLOUDRU.md) | Пошаговый деплой на **cloud.ru** через ВМ: VM, Artifact Registry, Object Storage, security groups |
 | [CLOUDRU_CONTAINERAPPS.md](CLOUDRU_CONTAINERAPPS.md) | Serverless-деплой на **cloud.ru** Container Apps: без ВМ, min instances=1, Artifact Registry, S3-том |
