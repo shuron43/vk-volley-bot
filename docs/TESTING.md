@@ -7,7 +7,7 @@
 ```bash
 uv run --frozen ruff check src tests
 uv run --frozen ruff format --check src tests
-uv run --frozen basedpyright
+uv run --frozen basedpyright --level error
 uv run --frozen pytest --cov=src --cov-report=term-missing
 ```
 

@@ -183,7 +183,7 @@ printf 'access_token=%s&v=5.199' "$VK_TOKEN" \
 # Линтер и форматтер
 uv run ruff check src tests
 uv run ruff format --check src tests
-uv run basedpyright
+uv run basedpyright --level error
 
 # Тесты и обязательный порог покрытия 80%
 uv run pytest --cov=src --cov-report=term-missing

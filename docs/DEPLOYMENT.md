@@ -15,7 +15,7 @@
 ```bash
 uv run ruff check src tests
 uv run ruff format --check src tests
-uv run basedpyright
+uv run basedpyright --level error
 uv run pytest --cov=src --cov-report=term-missing
 uv run python -m src.main
 ```

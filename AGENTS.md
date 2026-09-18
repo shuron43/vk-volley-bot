@@ -94,7 +94,7 @@ uv sync
 # lint / format / type-check (mirrors CI)
 uv run ruff check src tests
 uv run ruff format --check src tests
-uv run basedpyright
+uv run basedpyright --level error
 
 # tests with mandatory 80% coverage gate
 uv run pytest --cov=src --cov-report=term-missing
