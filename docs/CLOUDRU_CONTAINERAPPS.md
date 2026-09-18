@@ -210,7 +210,7 @@ VK бот — не HTTP-сервис, поэтому используйте **ex
 
 ```bash
 # Локально: внесите изменения, коммит, пуш в основную ветку репозитория
-git push origin master
+git push origin main
 
 # Сборка и пуш нового образа
 IMAGE_URI=<полный-URI-образа-из-Artifact-Registry>

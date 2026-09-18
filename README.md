@@ -221,7 +221,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start_bot.ps1
 - [x] Фиксированный лимит списка: 100 участников
 - [ ] Очередь ожидания
 - [ ] SQLite вместо JSON
-- [x] CI: GitHub Actions для ветки `master`
+- [x] CI: GitHub Actions для ветки `main`
 
 ---
 

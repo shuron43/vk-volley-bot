@@ -3,7 +3,7 @@
 **Stack:** Python 3.12, uv, vkbottle 4.x, anyio, pydantic/pydantic-settings
 **Layout:** src-package (imports as `from src.x import y`)
 **Entry:** `src/main.py` via `anyio.run(main)`
-**CI:** GitHub Actions on `master` — ruff check + format, basedpyright, pytest with coverage ≥80%, pip-audit
+**CI:** GitHub Actions on `main` — ruff check + format, basedpyright, pytest with coverage ≥80%, pip-audit
 
 ## STRUCTURE
 ```
@@ -119,6 +119,6 @@ docker run -d --env-file .env --restart unless-stopped vk-volleyball-bot
 - **Scheduler events:** Two recurring events — `collect` (clears the list, sends announcement) and `remind` (sends current list, no clear). `Config` rejects identical weekday+time for both when reminder is enabled.
 - **Peer restriction:** Every handler is wrapped in `target_peer_only`; events from any chat other than `CHAT_PEER_ID` are silently ignored before reading or mutating data.
 - **Admin rights:** `ADMIN_VK_IDS_RAW` is a comma-separated env var parsed into a tuple of positive ints (`NoDecode`, custom pre-validator). Admin commands refuse non-admins with a logged warning.
-- **CI:** `.github/workflows/ci.yml` on push/PR to `master`: ruff check, ruff format --check, basedpyright, pytest with coverage gate, pip-audit.
+- **CI:** `.github/workflows/ci.yml` on push/PR to `main`: ruff check, ruff format --check, basedpyright, pytest with coverage gate, pip-audit.
 - **Inline keyboard:** All bot responses include the inline keyboard; weekly announcement and reminder also include it. Callback events require `PayloadRule` handlers on `GroupEventType.MESSAGE_EVENT`.
 - **Package name quirk:** The src-layout package is literally called `src`, so imports read `from src.bot import ...`. If refactored to a real package name, every import and the `Dockerfile` CMD change.
