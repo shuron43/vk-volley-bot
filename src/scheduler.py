@@ -2,7 +2,6 @@
 
 import datetime
 import logging
-import secrets
 from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Final, Literal, NoReturn
@@ -11,9 +10,8 @@ import anyio
 from vkbottle import VKAPIError
 from vkbottle.api import API
 
+from src.cards import CardPublisher, MessageRef
 from src.config import Config
-from src.formatting import format_entries, format_event_start, format_registration_card
-from src.keyboard import build_inline_keyboard
 from src.storage import Storage
 
 _RETRY_DELAY_SECONDS: Final = 5 * 60
@@ -48,57 +46,12 @@ def _weekly_event_after(
     )
 
 
-def _announcement_message(event_starts_at: datetime.datetime) -> str:
-    return (
-        "🏐 Запись на волейбол открыта!\n"
-        f"🗓 Начало: {format_event_start(event_starts_at)}\n\n"
-        "Кто идёт? Нажми «Записаться» или добавь друга командой + Имя.\n"
-        "Запись автоматически закроется в момент начала."
-    )
-
-
-async def _send_announcement(
-    api: API,
-    config: Config,
-    inline_keyboard: str,
-    event_starts_at: datetime.datetime | None = None,
-    random_id: int | None = None,
-) -> int | None:
-    """Send an event announcement to the configured chat."""
-    resolved_start = event_starts_at or _weekly_event_after(
-        datetime.datetime.now(),  # noqa: DTZ005
-        config,
-    )
-    message_id = await api.messages.send(
-        peer_id=config.chat_peer_id,
-        message=_announcement_message(resolved_start),
-        keyboard=inline_keyboard,
-        random_id=(
-            random_id if random_id is not None else secrets.randbelow(2_147_483_646) + 1
-        ),
-    )
-    return message_id if type(message_id) is int else None
-
-
 async def _send_reminder(
-    api: API, config: Config, inline_keyboard: str, storage: Storage
+    cards: CardPublisher,
 ) -> None:
-    """Send a reminder with the current participant list."""
-    entries = await storage.list_entries()
-    event_starts_at, _ = await storage.event_details()
-    event_line = (
-        f"\n🗓 Начало: {format_event_start(event_starts_at)}"
-        if event_starts_at is not None
-        else ""
-    )
-    message = (
-        f"🏐 Напоминаем: сбор на волейбол!{event_line}\n\n{format_entries(entries)}"
-    )
-    _ = await api.messages.send(
-        peer_id=config.chat_peer_id,
-        message=message,
-        keyboard=inline_keyboard,
-        random_id=secrets.randbelow(2_147_483_647),
+    """Move the single card last and mark it as a reminder."""
+    _ = await cards.replace_current(
+        notice="Напоминание: проверьте список участников перед тренировкой."
     )
 
 
@@ -151,8 +104,14 @@ def _now_for(reference: datetime.datetime) -> datetime.datetime:
     return datetime.datetime.now(tz=reference.tzinfo)
 
 
-async def _finish_opening(api: API, config: Config, storage: Storage) -> bool:
+async def _finish_opening(
+    api: API,
+    config: Config,
+    storage: Storage,
+    cards: CardPublisher | None = None,
+) -> bool:
     """Resume delivery and durable activation of an interrupted event."""
+    publisher = cards or CardPublisher(api, config, storage)
     event_starts_at, event_source = await storage.event_details()
     if event_starts_at is None:
         event_starts_at = _weekly_event_after(datetime.datetime.now(), config)  # noqa: DTZ005
@@ -161,76 +120,75 @@ async def _finish_opening(api: API, config: Config, storage: Storage) -> bool:
     if await storage.announcement_random_id() is None:
         await storage.mark_opening(event_starts_at, event_source or "weekly")
     random_id = await storage.announcement_random_id()
-    message_id: int | None = None
-    try:
-        message_id = await _run_with_retry(
-            "Weekly announcement",
-            partial(
-                _send_announcement,
-                api,
-                config,
-                build_inline_keyboard(),
+    if random_id is None:
+        message = "Pending event has no announcement_random_id"
+        raise RuntimeError(message)
+    _LOGGER.info(
+        "Publishing event card: source=%s start=%s random_id=%s",
+        event_source,
+        event_starts_at,
+        random_id,
+    )
+
+    async def activate(ref: MessageRef) -> None:
+        if _now_for(event_starts_at) >= event_starts_at:
+            _LOGGER.warning(
+                "Rejecting late event activation: start=%s message_id=%s cmid=%s",
                 event_starts_at,
-                random_id,
-            ),
-            deadline=event_starts_at,
+                ref.message_id,
+                ref.conversation_message_id,
+            )
+            raise _EventExpiredError
+        await storage.activate_event(
+            ref.message_id,
+            event_starts_at,
+            conversation_message_id=ref.conversation_message_id,
         )
-        await _run_with_retry(
-            "Registration activation",
-            partial(storage.activate_event, message_id, event_starts_at),
+
+    try:
+        _ = await _run_with_retry(
+            "Event card publication",
+            partial(publisher.publish_event, event_starts_at, random_id, activate),
             deadline=event_starts_at,
         )
     except _EventExpiredError:
-        if message_id is not None:
-            await storage.set_status_message_id(message_id)
-        await _close_event(api, config, storage, build_inline_keyboard())
+        await _close_event(storage, publisher)
         return False
     return True
 
 
-async def _refresh_status_card(
-    api: API, config: Config, storage: Storage, inline_keyboard: str
-) -> None:
-    """Edit the canonical card after automatic closure when possible."""
-    message_id = await storage.status_message_id()
-    conversation_message_id = await storage.status_conversation_message_id()
-    if not message_id and not conversation_message_id:
-        return
-    entries = await storage.list_entries()
-    state = await storage.registration_state()
-    event_starts_at, _ = await storage.event_details()
-    try:
-        _ = await api.messages.edit(
-            peer_id=config.chat_peer_id,
-            message_id=message_id if not conversation_message_id else None,
-            conversation_message_id=conversation_message_id,
-            message=format_registration_card(entries, state, event_starts_at),
-            keyboard=inline_keyboard,
-        )
-    except (OSError, TimeoutError, VKAPIError):
-        _LOGGER.exception("Could not refresh registration card after closure")
-
-
 async def _close_event(
-    api: API, config: Config, storage: Storage, inline_keyboard: str
+    storage: Storage,
+    cards: CardPublisher,
 ) -> None:
     """Close registration and update the existing card without chat spam."""
     if await storage.close_registration():
-        _LOGGER.info("Registration closed at event start")
-        await _refresh_status_card(api, config, storage, inline_keyboard)
+        event_starts_at, source = await storage.event_details()
+        _LOGGER.info(
+            "Registration transition open/opening -> closed: start=%s source=%s",
+            event_starts_at,
+            source,
+        )
+        _ = await cards.edit_current()
 
 
-async def open_manual_event(
+async def open_manual_event(  # noqa: PLR0913
     api: API,
     config: Config,
     storage: Storage,
     event_starts_at: datetime.datetime,
     *,
+    cards: CardPublisher | None = None,
     now: datetime.datetime | None = None,
 ) -> None:
     """Open an administrator-created event after overlap checks."""
     current = now or datetime.datetime.now()  # noqa: DTZ005
     if event_starts_at <= current:
+        _LOGGER.warning(
+            "Manual event rejected because start elapsed: start=%s now=%s",
+            event_starts_at,
+            current,
+        )
         message = "Время начала события должно быть в будущем."
         raise ValueError(message)
     next_weekly_announcement = _next_target(
@@ -240,22 +198,37 @@ async def open_manual_event(
         config.collect_minute,
     )
     if event_starts_at >= next_weekly_announcement:
+        _LOGGER.warning(
+            "Manual event rejected: start=%s next_announcement=%s",
+            event_starts_at,
+            next_weekly_announcement,
+        )
         message = (
             "Событие пересекается со следующим еженедельным анонсом "
             f"{next_weekly_announcement:%d.%m.%Y %H:%M}."
         )
         raise ValueError(message)
     if not await storage.begin_event(event_starts_at, "manual"):
+        _LOGGER.warning("Manual event rejected because another event is active")
         message = "Уже есть активное событие с открытой записью."
         raise ValueError(message)
-    if not await _finish_opening(api, config, storage):
+    _LOGGER.info(
+        "Manual event transition closed -> opening: start=%s",
+        event_starts_at,
+    )
+    if not await _finish_opening(api, config, storage, cards):
         message = "Событие уже началось: запись осталась закрытой."
         raise ValueError(message)
 
 
-async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
+async def run_scheduler(
+    api: API,
+    config: Config,
+    storage: Storage,
+    cards: CardPublisher | None = None,
+) -> NoReturn:
     """Run weekly announcements, reminders, and automatic closures forever."""
-    inline_keyboard = build_inline_keyboard()
+    publisher = cards or CardPublisher(api, config, storage)
     _LOGGER.info(
         "Scheduler started: announcement=%d %s, event=%d %s",
         config.collect_weekday,
@@ -264,15 +237,21 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
         config.event_time,
     )
 
+    if await storage.close_missing_deadline():
+        _LOGGER.warning("Recovered active registration without a deadline")
+        _ = await publisher.edit_current(
+            notice="Предыдущее событие закрыто: время начала не было сохранено."
+        )
+
     if await storage.registration_state() == "opening":
         event_starts_at, _ = await storage.event_details()
         now = datetime.datetime.now()  # noqa: DTZ005
         if event_starts_at is not None and event_starts_at <= now:
             _LOGGER.info("Closing an interrupted event whose start has elapsed")
-            await _close_event(api, config, storage, inline_keyboard)
+            await _close_event(storage, publisher)
         else:
             _LOGGER.info("Resuming interrupted event announcement")
-            _ = await _finish_opening(api, config, storage)
+            _ = await _finish_opening(api, config, storage, publisher)
 
     while True:
         now = datetime.datetime.now()  # noqa: DTZ005
@@ -283,7 +262,7 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
             and event_starts_at is not None
             and event_starts_at <= now
         ):
-            await _close_event(api, config, storage, inline_keyboard)
+            await _close_event(storage, publisher)
             continue
 
         collect_target = _next_target(
@@ -310,18 +289,30 @@ async def run_scheduler(api: API, config: Config, storage: Storage) -> NoReturn:
             else None
         )
         target, action = _pick_next_event(collect_target, remind_target, close_target)
+        _LOGGER.info(
+            "Next scheduler action=%s target=%s state=%s start=%s",
+            action,
+            target.isoformat(),
+            state,
+            event_starts_at,
+        )
         await anyio.sleep((target - now).total_seconds())
 
         if action == "collect":
             event_start = _weekly_event_after(target, config)
             if await storage.begin_event(event_start, "weekly"):
-                _ = await _finish_opening(api, config, storage)
+                _LOGGER.info(
+                    "Weekly opening: announcement=%s start=%s",
+                    target,
+                    event_start,
+                )
+                _ = await _finish_opening(api, config, storage, publisher)
             else:
                 _LOGGER.warning("Weekly announcement skipped: another event is active")
         elif action == "close":
-            await _close_event(api, config, storage, inline_keyboard)
+            await _close_event(storage, publisher)
         else:
             await _run_with_retry(
                 "Weekly reminder",
-                partial(_send_reminder, api, config, inline_keyboard, storage),
+                partial(_send_reminder, publisher),
             )

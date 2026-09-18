@@ -200,6 +200,42 @@ async def test_storage_persists_status_message_id(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_snapshot_returns_one_consistent_lifecycle_view(tmp_path: Path) -> None:
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    starts_at = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "manual")
+    await storage.activate_event(123, starts_at, conversation_message_id=45)
+    await storage.add_friend("Bob")
+
+    snapshot = await storage.snapshot()
+
+    assert [entry.name for entry in snapshot.participants] == ["Bob"]
+    assert snapshot.state == "open"
+    assert snapshot.status_message_id == 123
+    assert snapshot.status_conversation_message_id == 45
+    assert snapshot.event_starts_at == starts_at
+    assert snapshot.event_source == "manual"
+
+
+@pytest.mark.anyio
+async def test_missing_deadline_recovery_closes_without_clearing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.start_new_collection(123)
+    await storage.add_friend("Bob")
+
+    assert await storage.close_missing_deadline() is True
+
+    restored = Storage(path)
+    assert await restored.registration_state() == "closed"
+    assert [entry.name for entry in await restored.list_entries()] == ["Bob"]
+    assert await restored.close_missing_deadline() is False
+
+
+@pytest.mark.anyio
 async def test_storage_preserves_lifecycle_when_start_collection_save_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

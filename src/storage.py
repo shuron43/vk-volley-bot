@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import logging
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, ClassVar, Final, Literal
 
@@ -38,12 +39,26 @@ class FriendEntry(BaseModel):
 
 Entry = UserEntry | FriendEntry
 EventSource = Literal["weekly", "manual"]
+RegistrationState = Literal["closed", "opening", "open"]
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationSnapshot:
+    """Consistent view of the event and its canonical VK card."""
+
+    participants: tuple[Entry, ...]
+    state: RegistrationState
+    status_message_id: int | None
+    status_conversation_message_id: int | None
+    collection_id: int
+    event_starts_at: datetime.datetime | None
+    event_source: EventSource | None
 
 
 class _StorageData(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
     participants: tuple[Annotated[Entry, Field(discriminator="kind")], ...]
-    registration_state: Literal["closed", "opening", "open"] = "closed"
+    registration_state: RegistrationState = "closed"
     status_message_id: int | None = None
     status_conversation_message_id: int | None = None
     collection_id: int = 0
@@ -59,7 +74,7 @@ class Storage:
         """Load existing data or start empty."""
         self._path: Path = path
         self._entries: list[Entry] = []
-        self._registration_state: Literal["closed", "opening", "open"] = "closed"
+        self._registration_state: RegistrationState = "closed"
         self._status_message_id: int | None = None
         self._status_conversation_message_id: int | None = None
         self._collection_id: int = 0
@@ -182,7 +197,7 @@ class Storage:
         async with self._lock:
             return list(self._entries)
 
-    async def registration_state(self) -> Literal["closed", "opening", "open"]:
+    async def registration_state(self) -> RegistrationState:
         """Return the current registration lifecycle state."""
         async with self._lock:
             return self._registration_state
@@ -196,6 +211,19 @@ class Storage:
         """Return the canonical card identifier inside the conversation."""
         async with self._lock:
             return self._status_conversation_message_id
+
+    async def snapshot(self) -> RegistrationSnapshot:
+        """Return one lock-consistent snapshot for rendering and diagnostics."""
+        async with self._lock:
+            return RegistrationSnapshot(
+                participants=tuple(self._entries),
+                state=self._registration_state,
+                status_message_id=self._status_message_id,
+                status_conversation_message_id=(self._status_conversation_message_id),
+                collection_id=self._collection_id,
+                event_starts_at=self._event_starts_at,
+                event_source=self._event_source,
+            )
 
     async def mark_opening(
         self,
@@ -262,6 +290,8 @@ class Storage:
         self,
         status_message_id: int | None,
         expected_start: datetime.datetime,
+        *,
+        conversation_message_id: int | None = None,
     ) -> None:
         """Activate the pending event only if it is still current."""
         async with self._lock:
@@ -275,6 +305,7 @@ class Storage:
                     participants=(),
                     registration_state="open",
                     status_message_id=status_message_id,
+                    status_conversation_message_id=conversation_message_id,
                     collection_id=self._collection_id + 1,
                     event_starts_at=self._event_starts_at,
                     event_source=self._event_source,
@@ -296,6 +327,32 @@ class Storage:
                     ),
                     collection_id=self._collection_id,
                     event_starts_at=self._event_starts_at,
+                    event_source=self._event_source,
+                )
+            )
+            return True
+
+    async def close_missing_deadline(self) -> bool:
+        """Close legacy active state that cannot be scheduled safely."""
+        async with self._lock:
+            if (
+                self._registration_state == "closed"
+                or self._event_starts_at is not None
+            ):
+                return False
+            _LOGGER.warning(
+                "Closing legacy %s registration without event_starts_at",
+                self._registration_state,
+            )
+            await self._commit(
+                _StorageData(
+                    participants=tuple(self._entries),
+                    registration_state="closed",
+                    status_message_id=self._status_message_id,
+                    status_conversation_message_id=(
+                        self._status_conversation_message_id
+                    ),
+                    collection_id=self._collection_id,
                     event_source=self._event_source,
                 )
             )

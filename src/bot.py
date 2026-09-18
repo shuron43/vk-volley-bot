@@ -1,6 +1,5 @@
 """VK bot message handlers."""
 
-import asyncio
 import datetime
 import logging
 from collections.abc import Awaitable, Callable
@@ -11,39 +10,14 @@ from vkbottle import GroupEventType, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
 from vkbottle.dispatch.rules.base import PayloadRule, RegexRule
 
+from src.cards import CardPublisher
 from src.config import Config
-from src.formatting import format_registration_card, help_text
-from src.keyboard import build_inline_keyboard
+from src.formatting import help_text
 from src.scheduler import open_manual_event
 from src.storage import Storage
 
 _LOGGER: Final = logging.getLogger(__name__)
 _EventT = TypeVar("_EventT", Message, MessageEvent)
-
-
-async def temporary_answer(msg: Message, message: str, *, keyboard: str) -> None:
-    """Show feedback briefly, then delete only the bot's own reply for everyone."""
-    sent = await msg.answer(message, keyboard=keyboard)
-    message_id = sent.message_id
-    cmid = sent.conversation_message_id
-    has_cmid = type(cmid) is int and cmid > 0
-    if not has_cmid and (type(message_id) is not int or message_id <= 0):
-        return
-    await asyncio.sleep(10)
-    try:
-        if type(cmid) is int and cmid > 0:
-            _ = await msg.ctx_api.messages.delete(
-                peer_id=msg.peer_id,
-                cmids=[cmid],
-                delete_for_all=True,
-            )
-        elif type(message_id) is int and message_id > 0:
-            _ = await msg.ctx_api.messages.delete(
-                message_ids=[message_id],
-                delete_for_all=True,
-            )
-    except (VKAPIError, OSError, TimeoutError):
-        _LOGGER.warning("Could not delete temporary bot reply %s", message_id)
 
 
 def extract_friend_name(text: str) -> str:
@@ -68,14 +42,19 @@ def _admin_help_text() -> str:
         "очистить / сбросить — очистить список участников\n"
         "убрать Имя / удалить Имя — удалить участника по имени\n"
         "создать событие ДД.ММ.ГГГГ ЧЧ:ММ — открыть ручную запись\n"
+        "статус события — показать состояние и ID карточки\n"
         "админ помощь — показать эту справку"
     )
 
 
-def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa: C901,PLR0915
+def setup_handlers(  # noqa: C901,PLR0915
+    bot: Bot,
+    storage: Storage,
+    config: Config,
+    cards: CardPublisher | None = None,
+) -> None:
     """Register message handlers on the bot instance."""
-    inline_keyboard = build_inline_keyboard()
-    status_lock = asyncio.Lock()
+    publisher = cards or CardPublisher(bot.api, config, storage)
     registration_closed_message = (
         "Запись закрыта. Дождись следующего анонса или нажми «Помощь»."
     )
@@ -100,7 +79,6 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
         except ValueError as exc:
             return str(exc), False
         if added:
-            await refresh_canonical_status()
             _LOGGER.info("User %s (%s) signed up", vk_id, name)
             return "Ты записался!", True
         return "Ты уже в списке.", False
@@ -108,77 +86,32 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def leave_user(vk_id: int) -> tuple[str, bool]:
         """Remove a VK user and return feedback with its mutation result."""
         if await storage.remove_user(vk_id):
-            await refresh_canonical_status()
             _LOGGER.info("User %s signed off", vk_id)
             return "Ты отписался.", True
         return "Тебя не было в списке.", False
 
-    async def add_friend_by_name(name: str) -> str:
+    async def add_friend_by_name(name: str) -> tuple[str, bool]:
         """Register a friend and return the result message."""
         collection = await storage.active_collection()
         if collection is None:
-            return registration_closed_message
+            return registration_closed_message, False
         try:
             await storage.add_friend(name, expected_collection=collection)
         except ValueError as exc:
-            return str(exc)
-        await refresh_canonical_status()
+            return str(exc), False
         _LOGGER.info("Friend added: %s", name)
-        return f"{name} записан(а) как друг."
+        return f"{name} записан(а) как друг.", True
 
-    async def remove_friend_by_name(name: str) -> str:
+    async def remove_friend_by_name(name: str) -> tuple[str, bool]:
         """Remove a friend and return the result message."""
         if await storage.remove_friend(name):
-            await refresh_canonical_status()
             _LOGGER.info("Friend removed: %s", name)
-            return f"{name} убран(а) из списка."
-        return "Такого друга не нашлось."
+            return f"{name} убран(а) из списка.", True
+        return "Такого друга не нашлось.", False
 
-    async def refresh_canonical_status() -> None:
-        """Refresh the persisted registration status message when it is known."""
-        async with status_lock:
-            await edit_canonical_status()
-
-    async def card_text() -> str:
-        """Build a visible registration card, including the empty state."""
-        entries = await storage.list_entries()
-        state = await storage.registration_state()
-        event_starts_at, _ = await storage.event_details()
-        return format_registration_card(entries, state, event_starts_at)
-
-    async def delete_previous_card(message_id: int | None, cmid: int | None) -> None:
-        """Remove the previous bot card only after its replacement is durable."""
-        try:
-            if cmid is not None and cmid > 0:
-                _ = await bot.api.messages.delete(
-                    peer_id=config.chat_peer_id,
-                    cmids=[cmid],
-                    delete_for_all=True,
-                )
-            elif message_id is not None and message_id > 0:
-                _ = await bot.api.messages.delete(
-                    message_ids=[message_id],
-                    delete_for_all=True,
-                )
-        except (VKAPIError, OSError, TimeoutError):
-            _LOGGER.warning("Could not delete previous participant card")
-
-    async def edit_canonical_status() -> None:
-        """Read and publish the latest list while holding the status lock."""
-        message_id = await storage.status_message_id()
-        cmid = await storage.status_conversation_message_id()
-        if not message_id and not cmid:
-            return
-        try:
-            _ = await bot.api.messages.edit(
-                peer_id=config.chat_peer_id,
-                message_id=message_id if not cmid else None,
-                conversation_message_id=cmid,
-                message=await card_text(),
-                keyboard=inline_keyboard,
-            )
-        except (VKAPIError, OSError, TimeoutError):
-            _LOGGER.exception("Failed to refresh canonical status message")
+    async def publish_text_result(response: str, *, changed: bool) -> None:
+        """Move the only card last; show errors inside it without extra replies."""
+        _ = await publisher.replace_current(notice=None if changed else response)
 
     def target_peer_only(
         handler: Callable[[_EventT], Awaitable[None]],
@@ -206,83 +139,51 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def sign_up(msg: Message) -> None:
         # Shares join_user with cb_join.
-        response, _ = await join_user(msg.from_id)
-        await temporary_answer(
-            msg,
-            response,
-            keyboard=inline_keyboard,
-        )
+        response, changed = await join_user(msg.from_id)
+        await publish_text_result(response, changed=changed)
 
     @bot.on.message(text=["+"])
     @bot.on.message(RegexRule(r"^\+\s+$"))
     @target_peer_only
     async def bare_plus(msg: Message) -> None:
-        await temporary_answer(
-            msg,
-            bare_plus_message,
-            keyboard=inline_keyboard,
-        )
+        _ = msg
+        await publish_text_result(bare_plus_message, changed=False)
 
     @bot.on.message(text=["-", "отписаться"])
     @target_peer_only
     async def sign_off(msg: Message) -> None:
         # Shares leave_user with cb_leave.
-        response, _ = await leave_user(msg.from_id)
-        await temporary_answer(
-            msg,
-            response,
-            keyboard=inline_keyboard,
-        )
+        response, changed = await leave_user(msg.from_id)
+        await publish_text_result(response, changed=changed)
 
     @bot.on.message(RegexRule(r"^\+\s*(.+)$"))
     @target_peer_only
     async def add_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
         if not name:
-            await temporary_answer(
-                msg,
-                "Укажи имя друга: + Имя",
-                keyboard=inline_keyboard,
-            )
+            await publish_text_result("Укажи имя друга: + Имя", changed=False)
             return
-        await temporary_answer(
-            msg,
-            await add_friend_by_name(name),
-            keyboard=inline_keyboard,
-        )
+        response, changed = await add_friend_by_name(name)
+        await publish_text_result(response, changed=changed)
 
     @bot.on.message(RegexRule(r"^-\s*(.+)$"))
     @target_peer_only
     async def remove_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
-        await temporary_answer(
-            msg,
-            await remove_friend_by_name(name),
-            keyboard=inline_keyboard,
-        )
+        response, changed = await remove_friend_by_name(name)
+        await publish_text_result(response, changed=changed)
 
     @bot.on.message(text=["список", "участники", "кто идёт"])
     @target_peer_only
     async def show_list(msg: Message) -> None:
-        async with status_lock:
-            old_id = await storage.status_message_id()
-            old_cmid = await storage.status_conversation_message_id()
-            sent = await msg.answer(await card_text(), keyboard=inline_keyboard)
-            message_id = sent.message_id if type(sent.message_id) is int else None
-            cmid = sent.conversation_message_id
-            cmid = cmid if type(cmid) is int else None
-            if not message_id and not cmid:
-                return
-            await storage.set_status_message_id(
-                message_id, conversation_message_id=cmid
-            )
-            if (old_id, old_cmid) != (message_id, cmid):
-                await delete_previous_card(old_id, old_cmid)
+        _ = msg
+        _ = await publisher.replace_current()
 
     @bot.on.message(text=["?", "help", "помощь", "команды"])
     @target_peer_only
     async def help_cmd(msg: Message) -> None:
-        await temporary_answer(msg, help_text(), keyboard=inline_keyboard)
+        _ = msg
+        await publish_text_result(help_text(), changed=False)
 
     # --- Callback handlers for inline keyboard ---
 
@@ -294,7 +195,9 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def cb_join(event: MessageEvent) -> None:
         # Shares join_user with sign_up.
-        response, _ = await join_user(event.user_id)
+        response, changed = await join_user(event.user_id)
+        if changed:
+            _ = await publisher.edit_current()
         _ = await event.show_snackbar(response)
 
     @bot.on.raw_event(
@@ -305,7 +208,9 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     @target_peer_only
     async def cb_leave(event: MessageEvent) -> None:
         # Shares leave_user with sign_off.
-        response, _ = await leave_user(event.user_id)
+        response, changed = await leave_user(event.user_id)
+        if changed:
+            _ = await publisher.edit_current()
         _ = await event.show_snackbar(response)
 
     @bot.on.raw_event(
@@ -315,16 +220,8 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     )
     @target_peer_only
     async def cb_list(event: MessageEvent) -> None:
-        async with status_lock:
-            try:
-                _ = await event.edit_message(
-                    message=await card_text(),
-                    keyboard=inline_keyboard,
-                )
-            except (VKAPIError, OSError, TimeoutError):
-                _ = await event.show_snackbar("Напиши список — покажу новую карточку.")
-                return
-        _ = await event.show_snackbar("Участники показаны в этом сообщении.")
+        _ = await publisher.edit_current()
+        _ = await event.show_snackbar("Список участников обновлён.")
 
     @bot.on.raw_event(
         GroupEventType.MESSAGE_EVENT,
@@ -344,85 +241,76 @@ def setup_handlers(bot: Bot, storage: Storage, config: Config) -> None:  # noqa:
     async def admin_create_event(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized create_event attempt from %s", msg.from_id)
-            await temporary_answer(
-                msg,
+            await publish_text_result(
                 "Только администраторы могут использовать эту команду.",
-                keyboard=inline_keyboard,
+                changed=False,
             )
             return
         try:
             event_starts_at = parse_event_start(msg.text or "")
-            await open_manual_event(bot.api, config, storage, event_starts_at)
+            await open_manual_event(
+                bot.api,
+                config,
+                storage,
+                event_starts_at,
+                cards=publisher,
+            )
         except ValueError as exc:
-            await temporary_answer(msg, str(exc), keyboard=inline_keyboard)
+            await publish_text_result(str(exc), changed=False)
             return
         _LOGGER.info("Manual event created by admin %s", msg.from_id)
-        await temporary_answer(
-            msg,
-            "Событие создано, запись открыта до начала.",
-            keyboard=inline_keyboard,
-        )
 
     @bot.on.message(text=["очистить", "сбросить"])
     @target_peer_only
     async def admin_clear(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized clear attempt from %s", msg.from_id)
-            await temporary_answer(
-                msg,
+            await publish_text_result(
                 "Только администраторы могут использовать эту команду.",
-                keyboard=inline_keyboard,
+                changed=False,
             )
             return
         await storage.clear()
-        await refresh_canonical_status()
         _LOGGER.info("List cleared by admin %s", msg.from_id)
-        await temporary_answer(
-            msg,
-            "Список участников очищен.",
-            keyboard=inline_keyboard,
-        )
+        _ = await publisher.replace_current()
 
     @bot.on.message(RegexRule(r"^(?:убрать|удалить)\s+(.+)$"))
     @target_peer_only
     async def admin_remove(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized remove attempt from %s", msg.from_id)
-            await temporary_answer(
-                msg,
+            await publish_text_result(
                 "Только администраторы могут использовать эту команду.",
-                keyboard=inline_keyboard,
+                changed=False,
             )
             return
         name = (msg.text or "").split(maxsplit=1)[1].strip()
         if await storage.remove_by_name(name):
-            await refresh_canonical_status()
             _LOGGER.info("Admin %s removed %s", msg.from_id, name)
-            await temporary_answer(
-                msg,
-                f"{name} убран(а) из списка.",
-                keyboard=inline_keyboard,
-            )
+            _ = await publisher.replace_current()
         else:
-            await temporary_answer(
-                msg,
-                "Такого участника не нашлось.",
-                keyboard=inline_keyboard,
+            await publish_text_result("Такого участника не нашлось.", changed=False)
+
+    @bot.on.message(text=["статус события"])
+    @target_peer_only
+    async def admin_event_status(msg: Message) -> None:
+        if not config.is_admin(msg.from_id):
+            _LOGGER.warning("Unauthorized event status attempt from %s", msg.from_id)
+            await publish_text_result(
+                "Только администраторы могут использовать эту команду.",
+                changed=False,
             )
+            return
+        await publish_text_result(await publisher.diagnostic_notice(), changed=False)
 
     @bot.on.message(text=["админ помощь", "admin help"])
     @target_peer_only
     async def admin_help(msg: Message) -> None:
         if not config.is_admin(msg.from_id):
             _LOGGER.warning("Unauthorized admin_help attempt from %s", msg.from_id)
-            await temporary_answer(
-                msg,
+            await publish_text_result(
                 "Только администраторы могут использовать эту команду.",
-                keyboard=inline_keyboard,
+                changed=False,
             )
             return
-        await temporary_answer(
-            msg,
-            _admin_help_text(),
-            keyboard=inline_keyboard,
-        )
+        await publish_text_result(_admin_help_text(), changed=False)

@@ -8,3 +8,5 @@ data.json
 .coverage
 .vkbottle/
 .omo/
+logs/
+.run/

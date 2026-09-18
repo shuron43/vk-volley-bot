@@ -91,6 +91,21 @@ docker run -d \
   vk-volleyball-bot
 ```
 
+### Длительный локальный запуск в Windows
+
+Для реального теста не оставляйте бота привязанным к временной терминальной
+сессии. Скрипт запускает скрытый процесс, сохраняет PID и перенаправляет вывод
+в постоянные файлы:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_bot.ps1
+Get-Content logs/bot.stderr.log -Wait
+```
+
+PID находится в `.run/bot.pid`, стандартный вывод — в
+`logs/bot.stdout.log`, журнал и ошибки — в `logs/bot.stderr.log`. Повторный
+запуск скрипта не создаёт второй процесс, если сохранённый PID ещё работает.
+
 ### Docker Compose
 
 ```yaml

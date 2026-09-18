@@ -1,6 +1,7 @@
 """Formatting helpers for bot responses."""
 
 import datetime
+from collections.abc import Sequence
 from typing import Final, assert_never
 
 from src.storage import Entry, FriendEntry, UserEntry
@@ -25,9 +26,23 @@ _WEEKDAYS: Final = (
     "суббота",
     "воскресенье",
 )
+_MONTHS_GENITIVE: Final = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
 
 
-def format_entries(entries: list[Entry]) -> str:
+def format_entries(entries: Sequence[Entry]) -> str:
     """Format the participant list for a bot response."""
     if not entries:
         return "Пока никто не записался."
@@ -52,22 +67,42 @@ def help_text(*, compact: bool = False) -> str:
 
 def format_event_start(value: datetime.datetime) -> str:
     """Format a local event start for chat messages."""
-    return f"{_WEEKDAYS[value.weekday()]}, {value:%d.%m.%Y в %H:%M}"
+    weekday = _WEEKDAYS[value.weekday()].capitalize()
+    month = _MONTHS_GENITIVE[value.month - 1]
+    return f"{weekday}, {value.day} {month} {value.year} в {value:%H:%M}"
 
 
 def format_registration_card(
-    entries: list[Entry],
+    entries: Sequence[Entry],
     state: str,
     event_starts_at: datetime.datetime | None,
+    *,
+    notice: str | None = None,
 ) -> str:
     """Build the canonical registration card."""
-    label = "Запись открыта" if state == "open" else "Запись закрыта"
-    event_line = (
-        f"\n🗓 Начало: {format_event_start(event_starts_at)}"
-        if event_starts_at is not None
-        else ""
-    )
-    return (
-        f"🏐 {label} · Участников: {len(entries)}{event_line}\n\n"
-        f"{format_entries(entries)}"
-    )
+    labels = {
+        "open": "запись открыта",
+        "opening": "открываем запись",
+        "closed": "запись закрыта",
+    }
+    lines = [f"🏐 Волейбол — {labels.get(state, 'запись закрыта')}"]
+    if event_starts_at is not None:
+        weekday = _WEEKDAYS[event_starts_at.weekday()].capitalize()
+        month = _MONTHS_GENITIVE[event_starts_at.month - 1]
+        lines.extend(
+            (
+                f"📅 {weekday}, {event_starts_at.day} {month} {event_starts_at.year}",
+                f"🕢 Начало: {event_starts_at:%H:%M}",
+            )
+        )
+        if state == "open":
+            lines.append(f"⏳ Запись закроется автоматически в {event_starts_at:%H:%M}")
+    lines.extend(("", f"Участники: {len(entries)}"))
+    if entries:
+        body = format_entries(entries).removeprefix("Список участников:\n")
+        lines.append(body)
+    else:
+        lines.append("Пока никто не записался.")
+    if notice:
+        lines.extend(("", f"ℹ️ {notice}"))
+    return "\n".join(lines)

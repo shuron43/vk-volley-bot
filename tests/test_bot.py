@@ -10,14 +10,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from src.bot import (
     _admin_help_text,
-    build_inline_keyboard,
     extract_friend_name,
     help_text,
     parse_event_start,
     setup_handlers,
 )
 from src.config import Config
-from src.formatting import format_entries
+from src.formatting import format_entries, format_registration_card
+from src.keyboard import build_inline_keyboard
 from src.storage import FriendEntry, Storage, UserEntry
 from vkbottle import GroupEventType
 from vkbottle.bot import Bot, Message, MessageEvent
@@ -75,6 +75,23 @@ def test_help_text_when_requested() -> None:
     assert help_text(compact=True) == text
 
 
+def test_registration_card_contains_event_details_and_participants() -> None:
+    starts_at = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
+
+    text = format_registration_card(
+        [UserEntry(kind="user", vk_id=1, name="Алексей")],
+        "open",
+        starts_at,
+    )
+
+    assert text.startswith("🏐 Волейбол — запись открыта")
+    assert "📅 Вторник, 22 сентября 2026" in text
+    assert "🕢 Начало: 19:30" in text
+    assert "⏳ Запись закроется автоматически в 19:30" in text
+    assert "Участники: 1" in text
+    assert "1. Алексей" in text
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -126,6 +143,7 @@ def test_admin_help_text_contains_commands() -> None:
     assert "убрать" in text
     assert "удалить" in text
     assert "создать событие" in text
+    assert "статус события" in text
 
 
 def test_parse_event_start_uses_documented_format() -> None:
