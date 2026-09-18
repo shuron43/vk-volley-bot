@@ -24,7 +24,7 @@ if (Test-Path -LiteralPath $pidPath) {
 
 $process = Start-Process `
     -FilePath "uv" `
-    -ArgumentList @("run", "--frozen", "python", "-m", "src.main") `
+    -ArgumentList @("run", "--frozen", "python", "-X", "utf8", "-m", "src.main") `
     -WorkingDirectory $projectRoot `
     -RedirectStandardOutput $stdoutPath `
     -RedirectStandardError $stderrPath `
