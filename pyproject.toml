@@ -22,6 +22,7 @@ dev = [
 
 [tool.basedpyright]
 typeCheckingMode = "all"
+failOnWarnings = false
 pythonVersion = "3.12"
 pythonPlatform = "All"
 include = ["src"]

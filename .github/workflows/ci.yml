@@ -27,6 +27,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Check Linux process scripts
+        run: |
+          bash -n scripts/bot_common.sh scripts/start_bot.sh scripts/stop_bot.sh tests/test_process_scripts.sh
+          bash tests/test_process_scripts.sh
+
       - name: Run Ruff checks
         run: uv run ruff check src tests
 
@@ -34,7 +39,7 @@ jobs:
         run: uv run ruff format --check src tests
 
       - name: Run basedpyright
-        run: uv run basedpyright --level error
+        run: uv run basedpyright
 
       - name: Run tests with coverage
         run: uv run pytest --cov=src --cov-report=term-missing

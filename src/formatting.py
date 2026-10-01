@@ -11,10 +11,13 @@ _HELP_TEXT: Final = (
     "Запись открывается после анонса и закрывается в момент начала события.\n"
     "Для себя — «записаться» или кнопка «✅ Записаться».\n"
     "Чтобы отписаться — «отписаться» или кнопка «↩️ Отписаться».\n"
+    "После начала отписка и возврат доступны только первые 30 минут.\n"
+    "При отписке имя остаётся внизу с (-); повторная запись снимает отметку.\n"
+    "Это правило действует и для друзей: - Имя / + Имя.\n"
     "`+` без имени подскажет, как записаться, но не добавит вас.\n"
     "+ Имя — записать друга, пока запись открыта.\n"
     "- Имя — убрать друга.\n"
-    "📋 список — кто идёт.\n"
+    "список — показать актуальную карточку в конце чата\n"
     "❓ ? — помощь"
 )
 _WEEKDAYS: Final = (
@@ -49,11 +52,12 @@ def format_entries(entries: Sequence[Entry]) -> str:
 
     lines: list[str] = []
     for index, entry in enumerate(entries, 1):
+        name = f"{entry.name} (-)" if entry.withdrawn else entry.name
         match entry:
             case UserEntry():
-                lines.append(f"{index}. {entry.name}")
+                lines.append(f"{index}. {name}")
             case FriendEntry():
-                lines.append(f"{index}. {entry.name} (друг)")
+                lines.append(f"{index}. {name} (друг)")
             case unreachable:  # type: ignore[reportUnnecessaryComparison]
                 assert_never(unreachable)
     return "Список участников:\n" + "\n".join(lines)
@@ -97,7 +101,8 @@ def format_registration_card(
         )
         if state == "open":
             lines.append(f"⏳ Запись закроется автоматически в {event_starts_at:%H:%M}")
-    lines.extend(("", f"Участники: {len(entries)}"))
+    participant_count = sum(not entry.withdrawn for entry in entries)
+    lines.extend(("", f"Участники: {participant_count}"))
     if entries:
         body = format_entries(entries).removeprefix("Список участников:\n")
         lines.append(body)

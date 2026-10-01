@@ -10,7 +10,10 @@ from typing import Final, final
 
 from vkbottle import VKAPIError
 from vkbottle.api import API
-from vkbottle_types.objects import MessagesSendUserIdsResponseItem
+from vkbottle_types.objects import (
+    MessagesDeleteFullResponseItem,
+    MessagesSendUserIdsResponseItem,
+)
 
 from src.config import Config
 from src.formatting import format_registration_card
@@ -23,6 +26,17 @@ _MAX_RANDOM_ID: Final = 2_147_483_646
 
 class CardIdentityError(OSError):
     """VK accepted a card but did not return an editable message identifier."""
+
+
+class EventChangedError(ValueError):
+    """An announcement was cancelled or superseded before its delivery."""
+
+
+def check_delete_response(response: Sequence[MessagesDeleteFullResponseItem]) -> None:
+    """Raise when VK returns an individual deletion failure without an API error."""
+    if any(item.response is False or item.error is not None for item in response):
+        message = "VK rejected message deletion"
+        raise OSError(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,27 +128,44 @@ class CardPublisher:
         )
         return ref
 
-    async def _delete(self, ref: MessageRef) -> None:
+    async def _delete(self, ref: MessageRef) -> bool:
         if not ref.usable:
-            return
+            return True
         try:
             if ref.conversation_message_id is not None:
-                _ = await self._api.messages.delete(
+                result = await self._api.messages.delete(
                     peer_id=self._config.chat_peer_id,
                     cmids=[ref.conversation_message_id],
                     delete_for_all=True,
                 )
             elif ref.message_id is not None:
-                _ = await self._api.messages.delete(
+                result = await self._api.messages.delete(
                     message_ids=[ref.message_id],
                     delete_for_all=True,
                 )
+            else:
+                return True
+            check_delete_response(result)
         except (OSError, TimeoutError, VKAPIError):
             _LOGGER.warning(
                 "Could not delete superseded event card: message_id=%s cmid=%s",
                 ref.message_id,
                 ref.conversation_message_id,
             )
+            return False
+        return True
+
+    async def delete_event(self) -> bool:
+        """Cancel under the publication lock so an in-flight card cannot return."""
+        async with self._lock:
+            snapshot = await self._storage.snapshot()
+            existed = await self._storage.delete_event(retain_card=True)
+            if not await self._delete(_snapshot_ref(snapshot)):
+                message = "Событие отменено, но VK не разрешил удалить его карточку."
+                raise OSError(message)
+            if snapshot.status_message_id or snapshot.status_conversation_message_id:
+                await self._storage.set_status_message_id(None)
+            return existed
 
     async def _replace_unlocked(self, *, notice: str | None = None) -> MessageRef:
         snapshot = await self._storage.snapshot()
@@ -151,10 +182,10 @@ class CardPublisher:
                 conversation_message_id=new_ref.conversation_message_id,
             )
         except BaseException:
-            await self._delete(new_ref)
+            _ = await self._delete(new_ref)
             raise
         if new_ref != old_ref:
-            await self._delete(old_ref)
+            _ = await self._delete(old_ref)
         return new_ref
 
     async def replace_current(self, *, notice: str | None = None) -> MessageRef:
@@ -198,6 +229,12 @@ class CardPublisher:
         """Publish and atomically activate a new empty event card."""
         async with self._lock:
             old_snapshot = await self._storage.snapshot()
+            if (
+                old_snapshot.state != "opening"
+                or old_snapshot.event_starts_at != event_starts_at
+                or await self._storage.announcement_random_id() != random_id
+            ):
+                raise EventChangedError
             old_ref = _snapshot_ref(old_snapshot)
             new_ref = await self._send(
                 (),
@@ -208,10 +245,10 @@ class CardPublisher:
             try:
                 await activate(new_ref)
             except BaseException:
-                await self._delete(new_ref)
+                _ = await self._delete(new_ref)
                 raise
             if new_ref != old_ref:
-                await self._delete(old_ref)
+                _ = await self._delete(old_ref)
             return new_ref
 
     async def diagnostic_notice(self) -> str:

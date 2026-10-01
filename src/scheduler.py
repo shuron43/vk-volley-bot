@@ -2,6 +2,7 @@
 
 import datetime
 import logging
+from asyncio import Event
 from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Final, Literal, NoReturn
@@ -10,7 +11,7 @@ import anyio
 from vkbottle import VKAPIError
 from vkbottle.api import API
 
-from src.cards import CardPublisher, MessageRef
+from src.cards import CardPublisher, EventChangedError, MessageRef
 from src.config import Config
 from src.storage import Storage
 
@@ -154,6 +155,9 @@ async def _finish_opening(
     except _EventExpiredError:
         await _close_event(storage, publisher)
         return False
+    except EventChangedError:
+        _LOGGER.info("Event announcement cancelled before delivery")
+        return False
     return True
 
 
@@ -170,6 +174,13 @@ async def _close_event(
             source,
         )
         _ = await cards.edit_current()
+
+
+async def _wait_for_schedule_change(changed: Event, delay: float) -> bool:
+    """Wait for the deadline or a durable change that requires recalculation."""
+    with anyio.move_on_after(max(0, delay)) as scope:
+        _ = await changed.wait()
+    return not scope.cancel_called
 
 
 async def open_manual_event(  # noqa: PLR0913
@@ -254,9 +265,11 @@ async def run_scheduler(
             _ = await _finish_opening(api, config, storage, publisher)
 
     while True:
+        changed = await storage.schedule_change_event()
         now = datetime.datetime.now()  # noqa: DTZ005
-        state = await storage.registration_state()
-        event_starts_at, _ = await storage.event_details()
+        snapshot = await storage.snapshot()
+        state = snapshot.state
+        event_starts_at = snapshot.event_starts_at
         if (
             state in {"opening", "open"}
             and event_starts_at is not None
@@ -296,7 +309,8 @@ async def run_scheduler(
             state,
             event_starts_at,
         )
-        await anyio.sleep((target - now).total_seconds())
+        if await _wait_for_schedule_change(changed, (target - now).total_seconds()):
+            continue
 
         if action == "collect":
             event_start = _weekly_event_after(target, config)

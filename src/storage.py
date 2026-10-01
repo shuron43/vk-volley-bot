@@ -18,6 +18,11 @@ _LOGGER: Final = logging.getLogger(__name__)
 _REGISTRATION_CHANGED_MSG = (
     "Запись закрыта или сбор изменился. Попробуй записаться снова."
 )
+_LATE_CHANGE_WINDOW: Final = datetime.timedelta(minutes=30)
+_LATE_CHANGE_CLOSED_MSG = (
+    "Запись закрыта. Отписаться или вернуться можно только в первые 30 минут "
+    "с начала события."
+)
 
 
 class UserEntry(BaseModel):
@@ -27,6 +32,7 @@ class UserEntry(BaseModel):
     kind: Literal["user"]
     vk_id: int
     name: str
+    withdrawn: bool = False
 
 
 class FriendEntry(BaseModel):
@@ -35,6 +41,7 @@ class FriendEntry(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
     kind: Literal["friend"]
     name: str
+    withdrawn: bool = False
 
 
 Entry = UserEntry | FriendEntry
@@ -82,6 +89,7 @@ class Storage:
         self._event_starts_at: datetime.datetime | None = None
         self._event_source: EventSource | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
+        self._schedule_changed: asyncio.Event = asyncio.Event()
         self._load()
 
     def _load(self) -> None:
@@ -115,6 +123,11 @@ class Storage:
 
     async def _commit(self, data: _StorageData) -> None:
         await self._save(data)
+        schedule_changed = (
+            self._registration_state != data.registration_state
+            or self._event_starts_at != data.event_starts_at
+            or self._collection_id != data.collection_id
+        )
         self._entries = list(data.participants)
         self._registration_state = data.registration_state
         self._status_message_id = data.status_message_id
@@ -123,6 +136,14 @@ class Storage:
         self._announcement_random_id = data.announcement_random_id
         self._event_starts_at = data.event_starts_at
         self._event_source = data.event_source
+        if schedule_changed:
+            self._schedule_changed.set()
+            self._schedule_changed = asyncio.Event()
+
+    async def schedule_change_event(self) -> asyncio.Event:
+        """Return a signal set by the next durable lifecycle change."""
+        async with self._lock:
+            return self._schedule_changed
 
     async def _commit_entries(self, entries: list[Entry]) -> None:
         await self._commit(
@@ -166,6 +187,83 @@ class Storage:
                     _ = entries.pop(i)
                     await self._commit_entries(entries)
                     return True
+            return False
+
+    def _now(self) -> datetime.datetime:
+        """Read local time with the persisted event's timezone awareness."""
+        tz = self._event_starts_at.tzinfo if self._event_starts_at else None
+        return datetime.datetime.now(tz=tz)
+
+    def _registration_is_open(self, now: datetime.datetime) -> bool:
+        return self._registration_state == "open" and (
+            self._event_starts_at is None or now < self._event_starts_at
+        )
+
+    def _check_late_change(self, now: datetime.datetime) -> None:
+        if (
+            self._registration_state not in {"open", "closed"}
+            or self._event_starts_at is None
+            or not (
+                self._event_starts_at
+                <= now
+                < self._event_starts_at + _LATE_CHANGE_WINDOW
+            )
+        ):
+            raise ValueError(_LATE_CHANGE_CLOSED_MSG)
+
+    async def _withdraw_entry(self, index: int) -> bool:
+        """Remove before start or mark after start, while holding the lock."""
+        now = self._now()
+        entries = self._entries.copy()
+        entry = entries.pop(index)
+        if not self._registration_is_open(now):
+            self._check_late_change(now)
+            if entry.withdrawn:
+                return False
+            entries.append(entry.model_copy(update={"withdrawn": True}))
+        await self._commit_entries(entries)
+        return True
+
+    async def _restore_entry(self, index: int) -> bool:
+        """Restore a marked participant within the grace period under the lock."""
+        self._check_late_change(self._now())
+        entries = self._entries.copy()
+        entry = entries.pop(index)
+        entries.append(entry.model_copy(update={"withdrawn": False}))
+        entries.sort(key=lambda participant: participant.withdrawn)
+        await self._commit_entries(entries)
+        return True
+
+    async def withdraw_user(self, vk_id: int) -> bool:
+        """Withdraw a user without discarding attendance history after start."""
+        async with self._lock:
+            for index, entry in enumerate(self._entries):
+                if entry.kind == "user" and entry.vk_id == vk_id:
+                    return await self._withdraw_entry(index)
+            return False
+
+    async def restore_user(self, vk_id: int) -> bool:
+        """Return a previously withdrawn user during the first half hour."""
+        async with self._lock:
+            for index, entry in enumerate(self._entries):
+                if entry.kind == "user" and entry.vk_id == vk_id and entry.withdrawn:
+                    return await self._restore_entry(index)
+            return False
+
+    async def withdraw_friend(self, name: str) -> bool:
+        """Withdraw the first named friend, retaining their row after start."""
+        async with self._lock:
+            for index, entry in enumerate(self._entries):
+                if entry.kind == "friend" and entry.name == name:
+                    return await self._withdraw_entry(index)
+            return False
+
+    async def restore_friend(self, name: str) -> bool:
+        """Return the first withdrawn friend with the requested name."""
+        async with self._lock:
+            for index, entry in enumerate(self._entries):
+                if entry.kind == "friend" and entry.name == name and entry.withdrawn:
+                    return await self._restore_entry(index)
             return False
 
     async def add_friend(
@@ -312,6 +410,33 @@ class Storage:
                 )
             )
 
+    async def delete_event(self, *, retain_card: bool = False) -> bool:
+        """Cancel the event; optionally retain card IDs until VK deletes it."""
+        async with self._lock:
+            existed = bool(
+                self._event_starts_at
+                or self._entries
+                or self._status_message_id
+                or self._status_conversation_message_id
+                or self._registration_state != "closed"
+            )
+            if existed:
+                await self._commit(
+                    _StorageData(
+                        participants=(),
+                        collection_id=self._collection_id + 1,
+                        status_message_id=(
+                            self._status_message_id if retain_card else None
+                        ),
+                        status_conversation_message_id=(
+                            self._status_conversation_message_id
+                            if retain_card
+                            else None
+                        ),
+                    )
+                )
+            return existed
+
     async def close_registration(self) -> bool:
         """Close the current event without discarding its final participant list."""
         async with self._lock:
@@ -379,12 +504,14 @@ class Storage:
     async def is_registration_open(self) -> bool:
         """Return whether the current collection accepts registrations."""
         async with self._lock:
-            return self._registration_state == "open"
+            return self._registration_is_open(self._now())
 
     async def active_collection(self) -> int | None:
         """Return the open collection token for a guarded registration."""
         async with self._lock:
-            return self._collection_id if self._registration_state == "open" else None
+            return (
+                self._collection_id if self._registration_is_open(self._now()) else None
+            )
 
     async def announcement_random_id(self) -> int | None:
         """Return the durable identifier of the pending announcement."""
@@ -400,7 +527,7 @@ class Storage:
 
     def _check_collection(self, expected_collection: int | None) -> None:
         if expected_collection is not None and (
-            self._registration_state != "open"
+            not self._registration_is_open(self._now())
             or self._collection_id != expected_collection
         ):
             raise ValueError(_REGISTRATION_CHANGED_MSG)

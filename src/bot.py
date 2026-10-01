@@ -2,6 +2,8 @@
 
 import datetime
 import logging
+import re
+import secrets
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Final, TypeVar
@@ -10,7 +12,7 @@ from vkbottle import GroupEventType, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
 from vkbottle.dispatch.rules.base import PayloadRule, RegexRule
 
-from src.cards import CardPublisher
+from src.cards import CardPublisher, check_delete_response
 from src.config import Config
 from src.formatting import help_text
 from src.scheduler import open_manual_event
@@ -22,12 +24,18 @@ _EventT = TypeVar("_EventT", Message, MessageEvent)
 
 def extract_friend_name(text: str) -> str:
     """Extract and trim the name following a friend command sign."""
-    return text[1:].strip()
+    return text.strip()[1:].strip()
 
 
 def parse_event_start(text: str) -> datetime.datetime:
     """Parse the date and time from an administrator event command."""
-    value = text.removeprefix("создать событие").strip()
+    value = re.sub(
+        r"^\s*создать\s+событие\s*",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
     try:
         return datetime.datetime.strptime(value, "%d.%m.%Y %H:%M")  # noqa: DTZ007
     except ValueError as exc:
@@ -42,6 +50,7 @@ def _admin_help_text() -> str:
         "очистить / сбросить — очистить список участников\n"
         "убрать Имя / удалить Имя — удалить участника по имени\n"
         "создать событие ДД.ММ.ГГГГ ЧЧ:ММ — открыть ручную запись\n"
+        "удалить событие — отменить событие и удалить карточку\n"
         "статус события — показать состояние и ID карточки\n"
         "админ помощь — показать эту справку"
     )
@@ -65,6 +74,11 @@ def setup_handlers(  # noqa: C901,PLR0915
 
     async def join_user(vk_id: int) -> tuple[str, bool]:
         """Register a VK user and return feedback with its mutation result."""
+        try:
+            if await storage.restore_user(vk_id):
+                return "Ты снова в списке! Отметка (-) снята.", True
+        except ValueError as exc:
+            return str(exc), False
         collection = await storage.active_collection()
         if collection is None:
             return registration_closed_message, False
@@ -80,18 +94,26 @@ def setup_handlers(  # noqa: C901,PLR0915
             return str(exc), False
         if added:
             _LOGGER.info("User %s (%s) signed up", vk_id, name)
-            return "Ты записался!", True
-        return "Ты уже в списке.", False
+        return ("Ты записался!" if added else "Ты уже в списке."), added
 
     async def leave_user(vk_id: int) -> tuple[str, bool]:
         """Remove a VK user and return feedback with its mutation result."""
-        if await storage.remove_user(vk_id):
+        try:
+            removed = await storage.withdraw_user(vk_id)
+        except ValueError as exc:
+            return str(exc), False
+        if removed:
             _LOGGER.info("User %s signed off", vk_id)
             return "Ты отписался.", True
-        return "Тебя не было в списке.", False
+        return "Тебя нет среди записанных участников.", False
 
     async def add_friend_by_name(name: str) -> tuple[str, bool]:
         """Register a friend and return the result message."""
+        try:
+            if await storage.restore_friend(name):
+                return f"{name} снова в списке. Отметка (-) снята.", True
+        except ValueError as exc:
+            return str(exc), False
         collection = await storage.active_collection()
         if collection is None:
             return registration_closed_message, False
@@ -104,10 +126,14 @@ def setup_handlers(  # noqa: C901,PLR0915
 
     async def remove_friend_by_name(name: str) -> tuple[str, bool]:
         """Remove a friend and return the result message."""
-        if await storage.remove_friend(name):
+        try:
+            removed = await storage.withdraw_friend(name)
+        except ValueError as exc:
+            return str(exc), False
+        if removed:
             _LOGGER.info("Friend removed: %s", name)
             return f"{name} убран(а) из списка.", True
-        return "Такого друга не нашлось.", False
+        return "Такого друга нет среди записанных участников.", False
 
     async def publish_text_result(response: str, *, changed: bool) -> None:
         """Move the only card last; show errors inside it without extra replies."""
@@ -135,28 +161,27 @@ def setup_handlers(  # noqa: C901,PLR0915
 
         return guarded
 
-    @bot.on.message(text=["записаться"])
+    @bot.on.message(RegexRule(re.compile(r"^\s*записаться\s*$", re.IGNORECASE)))
     @target_peer_only
     async def sign_up(msg: Message) -> None:
         # Shares join_user with cb_join.
         response, changed = await join_user(msg.from_id)
         await publish_text_result(response, changed=changed)
 
-    @bot.on.message(text=["+"])
-    @bot.on.message(RegexRule(r"^\+\s+$"))
+    @bot.on.message(RegexRule(r"^\s*\+\s*$"))
     @target_peer_only
     async def bare_plus(msg: Message) -> None:
         _ = msg
         await publish_text_result(bare_plus_message, changed=False)
 
-    @bot.on.message(text=["-", "отписаться"])
+    @bot.on.message(RegexRule(re.compile(r"^\s*(?:-|отписаться)\s*$", re.IGNORECASE)))
     @target_peer_only
     async def sign_off(msg: Message) -> None:
         # Shares leave_user with cb_leave.
         response, changed = await leave_user(msg.from_id)
         await publish_text_result(response, changed=changed)
 
-    @bot.on.message(RegexRule(r"^\+\s*(.+)$"))
+    @bot.on.message(RegexRule(r"^\s*\+\s*(\S.*?)\s*$"))
     @target_peer_only
     async def add_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
@@ -166,20 +191,24 @@ def setup_handlers(  # noqa: C901,PLR0915
         response, changed = await add_friend_by_name(name)
         await publish_text_result(response, changed=changed)
 
-    @bot.on.message(RegexRule(r"^-\s*(.+)$"))
+    @bot.on.message(RegexRule(r"^\s*-\s*(\S.*?)\s*$"))
     @target_peer_only
     async def remove_friend(msg: Message) -> None:
         name = extract_friend_name(msg.text or "")
         response, changed = await remove_friend_by_name(name)
         await publish_text_result(response, changed=changed)
 
-    @bot.on.message(text=["список", "участники", "кто идёт"])
+    @bot.on.message(
+        RegexRule(re.compile(r"^\s*(?:список|участники|кто\s+идёт)\s*$", re.IGNORECASE))
+    )
     @target_peer_only
     async def show_list(msg: Message) -> None:
         _ = msg
         _ = await publisher.replace_current()
 
-    @bot.on.message(text=["?", "help", "помощь", "команды"])
+    @bot.on.message(
+        RegexRule(re.compile(r"^\s*(?:\?|help|помощь|команды)\s*$", re.IGNORECASE))
+    )
     @target_peer_only
     async def help_cmd(msg: Message) -> None:
         _ = msg
@@ -216,36 +245,67 @@ def setup_handlers(  # noqa: C901,PLR0915
     @bot.on.raw_event(
         GroupEventType.MESSAGE_EVENT,
         MessageEvent,
-        PayloadRule({"cmd": "list"}),
-    )
-    @target_peer_only
-    async def cb_list(event: MessageEvent) -> None:
-        _ = await publisher.edit_current()
-        _ = await event.show_snackbar("Список участников обновлён.")
-
-    @bot.on.raw_event(
-        GroupEventType.MESSAGE_EVENT,
-        MessageEvent,
         PayloadRule({"cmd": "help"}),
     )
     @target_peer_only
     async def cb_help(event: MessageEvent) -> None:
         _ = await event.show_snackbar(
-            "Запись — кнопкой; друг: + Имя; выход: -; убрать: - Имя. Справка: помощь."
+            "список — показать актуальную карточку в конце чата. Справка: помощь."
         )
 
     # --- Admin handlers ---
 
-    @bot.on.message(RegexRule(r"^создать событие(?:\s+.*)?$"))
-    @target_peer_only
-    async def admin_create_event(msg: Message) -> None:
-        if not config.is_admin(msg.from_id):
-            _LOGGER.warning("Unauthorized create_event attempt from %s", msg.from_id)
-            await publish_text_result(
-                "Только администраторы могут использовать эту команду.",
-                changed=False,
+    async def private_admin_reply(msg: Message, text: str) -> None:
+        """Keep administrative feedback out of the conversation card."""
+        try:
+            _ = await bot.api.messages.send(
+                peer_id=msg.from_id,
+                message=text,
+                random_id=secrets.randbelow(2_147_483_646) + 1,
             )
-            return
+        except (OSError, TimeoutError, VKAPIError):
+            _LOGGER.exception("Could not send private admin reply to %s", msg.from_id)
+
+    def admin_command(
+        handler: Callable[[Message], Awaitable[None]],
+    ) -> Callable[[Message], Awaitable[None]]:
+        @wraps(handler)
+        async def handled(msg: Message) -> None:
+            try:
+                result = await bot.api.messages.delete(
+                    peer_id=msg.peer_id,
+                    cmids=[msg.conversation_message_id],
+                    delete_for_all=True,
+                )
+                check_delete_response(result)
+            except (OSError, TimeoutError, VKAPIError):
+                _LOGGER.exception("Could not delete admin command in %s", msg.peer_id)
+                await private_admin_reply(
+                    msg,
+                    "Команда не удалена. Выдай боту права администратора беседы.",
+                )
+            if not config.is_admin(msg.from_id):
+                _LOGGER.warning(
+                    "Unauthorized %s attempt from %s", handler.__name__, msg.from_id
+                )
+                await private_admin_reply(
+                    msg, "Только администраторы могут использовать эту команду."
+                )
+                return
+            try:
+                await handler(msg)
+            except (OSError, TimeoutError, VKAPIError) as exc:
+                _LOGGER.exception("Admin command %s failed", handler.__name__)
+                await private_admin_reply(msg, f"Не удалось выполнить команду: {exc}")
+
+        return handled
+
+    @bot.on.message(
+        RegexRule(re.compile(r"^\s*создать\s+событие(?:\s+.*)?\s*$", re.IGNORECASE))
+    )
+    @target_peer_only
+    @admin_command
+    async def admin_create_event(msg: Message) -> None:
         try:
             event_starts_at = parse_event_start(msg.text or "")
             await open_manual_event(
@@ -256,61 +316,52 @@ def setup_handlers(  # noqa: C901,PLR0915
                 cards=publisher,
             )
         except ValueError as exc:
-            await publish_text_result(str(exc), changed=False)
+            await private_admin_reply(msg, str(exc))
             return
         _LOGGER.info("Manual event created by admin %s", msg.from_id)
 
-    @bot.on.message(text=["очистить", "сбросить"])
+    @bot.on.message(
+        RegexRule(re.compile(r"^\s*(?:очистить|сбросить)\s*$", re.IGNORECASE))
+    )
     @target_peer_only
+    @admin_command
     async def admin_clear(msg: Message) -> None:
-        if not config.is_admin(msg.from_id):
-            _LOGGER.warning("Unauthorized clear attempt from %s", msg.from_id)
-            await publish_text_result(
-                "Только администраторы могут использовать эту команду.",
-                changed=False,
-            )
-            return
         await storage.clear()
         _LOGGER.info("List cleared by admin %s", msg.from_id)
-        _ = await publisher.replace_current()
+        _ = await publisher.edit_current()
 
-    @bot.on.message(RegexRule(r"^(?:убрать|удалить)\s+(.+)$"))
+    @bot.on.message(RegexRule(re.compile(r"^\s*удалить\s+событие\s*$", re.IGNORECASE)))
     @target_peer_only
+    @admin_command
+    async def admin_delete_event(msg: Message) -> None:
+        existed = await publisher.delete_event()
+        await private_admin_reply(
+            msg, "Событие удалено." if existed else "Нет события для удаления."
+        )
+
+    @bot.on.message(
+        RegexRule(re.compile(r"^\s*(?:убрать|удалить)\s+(.+?)\s*$", re.IGNORECASE))
+    )
+    @target_peer_only
+    @admin_command
     async def admin_remove(msg: Message) -> None:
-        if not config.is_admin(msg.from_id):
-            _LOGGER.warning("Unauthorized remove attempt from %s", msg.from_id)
-            await publish_text_result(
-                "Только администраторы могут использовать эту команду.",
-                changed=False,
-            )
-            return
         name = (msg.text or "").split(maxsplit=1)[1].strip()
         if await storage.remove_by_name(name):
             _LOGGER.info("Admin %s removed %s", msg.from_id, name)
-            _ = await publisher.replace_current()
+            _ = await publisher.edit_current()
         else:
-            await publish_text_result("Такого участника не нашлось.", changed=False)
+            await private_admin_reply(msg, "Такого участника не нашлось.")
 
-    @bot.on.message(text=["статус события"])
+    @bot.on.message(RegexRule(re.compile(r"^\s*статус\s+события\s*$", re.IGNORECASE)))
     @target_peer_only
+    @admin_command
     async def admin_event_status(msg: Message) -> None:
-        if not config.is_admin(msg.from_id):
-            _LOGGER.warning("Unauthorized event status attempt from %s", msg.from_id)
-            await publish_text_result(
-                "Только администраторы могут использовать эту команду.",
-                changed=False,
-            )
-            return
-        await publish_text_result(await publisher.diagnostic_notice(), changed=False)
+        await private_admin_reply(msg, await publisher.diagnostic_notice())
 
-    @bot.on.message(text=["админ помощь", "admin help"])
+    @bot.on.message(
+        RegexRule(re.compile(r"^\s*(?:админ\s+помощь|admin\s+help)\s*$", re.IGNORECASE))
+    )
     @target_peer_only
+    @admin_command
     async def admin_help(msg: Message) -> None:
-        if not config.is_admin(msg.from_id):
-            _LOGGER.warning("Unauthorized admin_help attempt from %s", msg.from_id)
-            await publish_text_result(
-                "Только администраторы могут использовать эту команду.",
-                changed=False,
-            )
-            return
-        await publish_text_result(_admin_help_text(), changed=False)
+        await private_admin_reply(msg, _admin_help_text())

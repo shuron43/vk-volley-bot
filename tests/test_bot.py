@@ -70,7 +70,7 @@ def test_help_text_when_requested() -> None:
     assert "не добавит вас" in text
     assert "отписаться" in text
     assert "- Имя" in text
-    assert "список" in text
+    assert "список — показать актуальную карточку в конце чата" in text
     assert "помощь" in text
     assert help_text(compact=True) == text
 
@@ -113,24 +113,24 @@ def test_extract_friend_name_when_command_contains_sign(
     assert actual == expected
 
 
-def test_build_inline_keyboard_when_serialized() -> None:
-    # Given: no external dependencies.
+def test_card_keyboard_when_serialized_has_three_actions() -> None:
+    # Given: participants are already visible in the event card.
     # When: the inline keyboard is built.
     keyboard = json.loads(build_inline_keyboard())
 
-    # Then: VK receives readable labels, stable commands, and neutral join controls.
+    # Then: only signup, withdrawal, and help are available as callback buttons.
+    assert keyboard["inline"] is True
+    assert [len(row) for row in keyboard["buttons"]] == [2, 1]
     buttons = [button for row in keyboard["buttons"] for button in row]
     actions = [button["action"] for button in buttons]
     assert [(action["label"], action["payload"]["cmd"]) for action in actions] == [
         ("✅ Записаться", "join"),
         ("↩️ Отписаться", "leave"),
-        ("📋 Список", "list"),
         ("❓ Помощь", "help"),
     ]
     assert [button.get("color") for button in buttons] == [
         "secondary",
         "secondary",
-        None,
         None,
     ]
 
@@ -146,8 +146,16 @@ def test_admin_help_text_contains_commands() -> None:
     assert "статус события" in text
 
 
-def test_parse_event_start_uses_documented_format() -> None:
-    assert parse_event_start("создать событие 22.09.2026 19:30") == (
+@pytest.mark.parametrize(
+    "text",
+    [
+        "создать событие 22.09.2026 19:30",
+        "Создать событие 22.09.2026 19:30",
+        "  СОЗДАТЬ   СОБЫТИЕ 22.09.2026 19:30  ",
+    ],
+)
+def test_parse_event_start_uses_documented_format(text: str) -> None:
+    assert parse_event_start(text) == (
         datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
     )
 

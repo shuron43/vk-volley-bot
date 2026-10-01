@@ -16,7 +16,6 @@ def build_inline_keyboard() -> str:
             color=KeyboardButtonColor.SECONDARY,
         )
         .row()
-        .add(Callback("📋 Список", payload={"cmd": "list"}))
         .add(Callback("❓ Помощь", payload={"cmd": "help"}))
         .get_json()
     )

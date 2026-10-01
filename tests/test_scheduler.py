@@ -15,6 +15,7 @@ from src.config import Config
 from src.storage import Storage
 
 if TYPE_CHECKING:
+    from asyncio import Event
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
@@ -286,7 +287,9 @@ async def test_scheduler_recovers_legacy_open_state_without_deadline(
     await storage.add_friend("Bob")
     publisher = _publisher()
     monkeypatch.setattr(
-        scheduler.anyio, "sleep", AsyncMock(side_effect=StopSchedulerError)
+        scheduler,
+        "_wait_for_schedule_change",
+        AsyncMock(side_effect=StopSchedulerError),
     )
 
     with pytest.raises(StopSchedulerError):
@@ -317,7 +320,9 @@ async def test_scheduler_closes_elapsed_event_and_preserves_participants(
         SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
     )
     monkeypatch.setattr(
-        scheduler.anyio, "sleep", AsyncMock(side_effect=StopSchedulerError)
+        scheduler,
+        "_wait_for_schedule_change",
+        AsyncMock(side_effect=StopSchedulerError),
     )
 
     with pytest.raises(StopSchedulerError):
@@ -337,13 +342,13 @@ async def test_scheduler_opens_weekly_event_after_announcement_time(
     storage = Storage(tmp_path / "participants.json")
     await storage.add_friend("Previous")
     publisher = _publisher()
-    sleep = AsyncMock(side_effect=[None, StopSchedulerError])
+    sleep = AsyncMock(side_effect=[False, StopSchedulerError])
     monkeypatch.setattr(
         scheduler,
         "datetime",
         SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
     )
-    monkeypatch.setattr(scheduler.anyio, "sleep", sleep)
+    monkeypatch.setattr(scheduler, "_wait_for_schedule_change", sleep)
 
     with pytest.raises(StopSchedulerError):
         await scheduler.run_scheduler(MagicMock(), config, storage, publisher)
@@ -355,3 +360,87 @@ async def test_scheduler_opens_weekly_event_after_announcement_time(
         "weekly",
     )
     publisher.publish_event.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_manual_event_wakes_sleeping_scheduler_and_closes_actual_card_on_time(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Given: an idle scheduler waiting an hour for the weekly announcement.
+    current = datetime.datetime(2024, 1, 1, 9, 0, tzinfo=datetime.UTC)
+    starts_at = current + datetime.timedelta(minutes=1)
+
+    class Clock(datetime.datetime):
+        @classmethod
+        def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+            return current
+
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(
+            datetime=Clock,
+            timedelta=datetime.timedelta,
+        ),
+    )
+    storage = Storage(tmp_path / "participants.json")
+    api = MagicMock()
+    api.messages.send = AsyncMock(return_value=123)
+    api.messages.edit = AsyncMock()
+    api.messages.delete = AsyncMock()
+    publisher = CardPublisher(api, config, storage)
+    original_wait = scheduler._wait_for_schedule_change
+    waits: list[float] = []
+
+    async def wait(changed: Event, delay: float) -> bool:
+        nonlocal current
+        waits.append(delay)
+        if len(waits) == 1:
+            # When: the admin creates a manual event while the scheduler sleeps.
+            await scheduler.open_manual_event(
+                api,
+                config,
+                storage,
+                starts_at,
+                cards=publisher,
+                now=current,
+            )
+            await storage.add_friend("Bob")
+            assert "запись открыта" in api.messages.send.await_args.kwargs["message"]
+            assert changed.is_set()
+            return await original_wait(changed, delay)
+        if len(waits) == 2:
+            # Advance the clock to the new deadline, without waiting in real time.
+            current = starts_at
+            return False
+        raise StopSchedulerError
+
+    monkeypatch.setattr(scheduler, "_wait_for_schedule_change", wait)
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(api, config, storage, publisher)
+
+    # Then: the new deadline replaces the weekly wait, and the card closes in place.
+    assert waits[:2] == [3600, 60]
+    api.messages.edit.assert_awaited_once()
+    text = api.messages.edit.await_args.kwargs["message"]
+    assert "запись закрыта" in text
+    assert "закроется автоматически" not in text
+    assert "1. Bob" in text
+    api.messages.send.assert_awaited_once()
+    assert await storage.registration_state() == "closed"
+    assert (
+        await Storage(tmp_path / "participants.json").registration_state() == "closed"
+    )
+
+
+@pytest.mark.anyio
+async def test_schedule_wait_distinguishes_deadline_from_change(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "participants.json")
+    changed = await storage.schedule_change_event()
+    assert not await scheduler._wait_for_schedule_change(changed, 0)
+    await storage.add_friend("Bob")
+    assert not changed.is_set()
+    assert await storage.begin_event(datetime.datetime.now(), "manual")  # noqa: DTZ005
+    assert await scheduler._wait_for_schedule_change(changed, 3600)

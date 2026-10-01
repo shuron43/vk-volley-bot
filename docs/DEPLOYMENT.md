@@ -15,10 +15,32 @@
 ```bash
 uv run ruff check src tests
 uv run ruff format --check src tests
-uv run basedpyright --level error
+uv run basedpyright
 uv run pytest --cov=src --cov-report=term-missing
 uv run python -m src.main
 ```
+
+Для фонового запуска без Docker:
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts/start_bot.ps1
+powershell -ExecutionPolicy Bypass -File scripts/stop_bot.ps1
+```
+
+```bash
+# Linux (Bash, uv, flock из util-linux)
+bash scripts/start_bot.sh
+bash scripts/stop_bot.sh
+```
+
+PID сохраняется в `.run/bot.pid`, логи — в `logs/bot.stdout.log` и
+`logs/bot.stderr.log`. Рабочая папка — корень проекта, независимо от папки
+вызова скрипта. На Linux выставь часовой пояс `Europe/Moscow`.
+Скрипты защищают от повторного запуска и проверяют принадлежность PID проекту
+перед остановкой. Linux сначала использует SIGTERM, затем через 10 секунд
+SIGKILL; Windows принудительно завершает дерево Python, включая venv launcher.
+Данные и логи при остановке остаются. Автозапуска после перезагрузки нет.
 
 Перед production-запуском `Config` должен успешно разобрать `.env`. В частности,
 включённое напоминание не может совпадать со сбором, а `ADMIN_VK_IDS_RAW`
