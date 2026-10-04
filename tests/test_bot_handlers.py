@@ -1,598 +1,708 @@
-"""Integration tests for functions registered with VKBottle."""
+"""Focused business specs through VK's message and callback boundaries."""
 
 from __future__ import annotations
 
 import datetime
+import json
 import secrets
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING, Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from src import scheduler
 from src.bot import setup_handlers
-from src.cards import CardPublisher, MessageRef
+from src.cards import CardPublisher
 from src.config import Config
-from src.storage import Storage
-from vkbottle import GroupEventType
-from vkbottle.bot import Bot, Message, MessageEvent
-from vkbottle_types.objects import MessagesDeleteFullResponseItem
+from src.keyboard import build_inline_keyboard
+from src.storage import RegistrationSnapshot, Storage
+from vkbottle.bot import Bot
+from vkbottle_types.objects import (
+    MessagesDeleteFullResponseItem,
+    MessagesSendUserIdsResponseItem,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
-    type _MessageHandler = Callable[[Message], Awaitable[None]]
-    type _CallbackHandler = Callable[[MessageEvent], Awaitable[None]]
-
-
-def _publisher() -> MagicMock:
-    publisher = MagicMock(spec=CardPublisher)
-    ref = MessageRef(message_id=10, conversation_message_id=20)
-    publisher.replace_current = AsyncMock(return_value=ref)
-    publisher.edit_current = AsyncMock(return_value=ref)
-    publisher.delete_event = AsyncMock(return_value=True)
-    publisher.diagnostic_notice = AsyncMock(return_value="Состояние: open")
-    return publisher
-
-
-async def _open_event(storage: Storage, message_id: int | None) -> None:
-    """Prepare a current event through the production lifecycle."""
-    starts_at = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
-    assert await storage.begin_event(starts_at, "weekly")
-    await storage.activate_event(message_id, starts_at)
-
-
-def _build_bot(storage: Storage, config: Config) -> tuple[Bot, MagicMock]:
-    bot = Bot(config.vk_token)
-    api = MagicMock()
-    api.users.get = AsyncMock(
-        return_value=[SimpleNamespace(first_name="Alice")],
-    )
-    api.messages.send = AsyncMock(return_value=1)
-    api.messages.delete = AsyncMock()
-    bot.api = api
-    publisher = _publisher()
-    setup_handlers(bot, storage, config, publisher)
-    return bot, publisher
-
-
-def _message_handlers(bot: Bot) -> dict[str, _MessageHandler]:
-    return {
-        registered.handler.__name__: registered.handler
-        for registered in bot.labeler.message_view.handlers
-    }
-
-
-def _callback_handlers(bot: Bot) -> dict[str, _CallbackHandler]:
-    registered_handlers = bot.labeler.raw_event_view.handlers[
-        GroupEventType.MESSAGE_EVENT
-    ]
-    return {
-        registered.handler.handler.__name__: registered.handler.handler
-        for registered in registered_handlers
-    }
-
-
-def _message(config: Config, *, text: str = "", user_id: int = 1) -> MagicMock:
-    message = MagicMock(spec=Message)
-    message.peer_id = config.chat_peer_id
-    message.from_id = user_id
-    message.text = text
-    message.conversation_message_id = 1
-    message.answer = AsyncMock()
-    return message
-
-
-def _event(config: Config, *, user_id: int = 1) -> MagicMock:
-    event = MagicMock(spec=MessageEvent)
-    event.peer_id = config.chat_peer_id
-    event.user_id = user_id
-    event.show_snackbar = AsyncMock()
-    return event
-
-
-@pytest.mark.anyio
-async def test_text_signup_updates_storage_and_moves_card_last(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, None)
-    bot, publisher = _build_bot(storage, config)
-    message = _message(config, text="записаться")
-
-    await _message_handlers(bot)["sign_up"](message)
-
-    assert [entry.name for entry in await storage.list_entries()] == ["Alice"]
-    publisher.replace_current.assert_awaited_once_with(notice=None)
-    message.answer.assert_not_awaited()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("callback", [False, True])
-async def test_closed_event_withdrawal_and_return_follow_half_hour_rule(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    callback: bool,
-) -> None:
-    # Given: registration is closed and the event started ten minutes ago.
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    starts_at = datetime.datetime(2026, 9, 30, 19, 30)  # noqa: DTZ001
-    assert await storage.begin_event(starts_at, "manual")
-    await storage.activate_event(10, starts_at)
-    await storage.add_user(1, "Alice")
-    await storage.add_user(2, "Bob")
-    await storage.close_registration()
-    monkeypatch.setattr(
-        Storage,
-        "_now",
-        lambda _: starts_at + datetime.timedelta(minutes=10),
-    )
-    bot, publisher = _build_bot(storage, config)
-    event = _event(config)
-    messages = _message_handlers(bot)
-    callbacks = _callback_handlers(bot)
-
-    # When: the participant withdraws, then signs up again via the same interface.
-    if callback:
-        await callbacks["cb_leave"](event)
-    else:
-        await messages["sign_off"](_message(config, text="отписаться"))
-    entries = await storage.list_entries()
-    assert [entry.name for entry in entries] == ["Bob", "Alice"]
-    assert entries[-1].withdrawn
-    if callback:
-        await callbacks["cb_join"](event)
-    else:
-        await messages["sign_up"](_message(config, text="записаться"))
-
-    # Then: the existing name is restored without a new profile lookup or entry.
-    assert all(not entry.withdrawn for entry in await storage.list_entries())
-    bot.api.users.get.assert_not_awaited()
-    if callback:
-        assert publisher.edit_current.await_count == 2
-        publisher.replace_current.assert_not_awaited()
-    else:
-        assert publisher.replace_current.await_count == 2
-        publisher.edit_current.assert_not_awaited()
-
-    # When: withdrawal is attempted at exactly thirty minutes after start.
-    before = await storage.snapshot()
-    monkeypatch.setattr(
-        Storage,
-        "_now",
-        lambda _: starts_at + datetime.timedelta(minutes=30),
-    )
-    if callback:
-        await callbacks["cb_leave"](event)
-        assert "30 минут" in event.show_snackbar.await_args.args[0]
-        assert publisher.edit_current.await_count == 2
-    else:
-        await messages["sign_off"](_message(config, text="отписаться"))
-        assert "30 минут" in publisher.replace_current.await_args.kwargs["notice"]
-    # Then: the final participant list is preserved and the refusal is visible.
-    assert await storage.snapshot() == before
-
-
-@pytest.mark.anyio
-async def test_friend_commands_restore_existing_row_after_start(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    starts_at = datetime.datetime(2026, 9, 30, 19, 30)  # noqa: DTZ001
-    assert await storage.begin_event(starts_at, "manual")
-    await storage.activate_event(10, starts_at)
-    await storage.add_friend("Друг")
-    await storage.close_registration()
-    monkeypatch.setattr(Storage, "_now", lambda _: starts_at)
-    bot, _publisher_mock = _build_bot(storage, config)
-    handlers = _message_handlers(bot)
-
-    await handlers["remove_friend"](_message(config, text="- Друг"))
-    assert (await storage.list_entries())[0].withdrawn
-    await handlers["add_friend"](_message(config, text="+ Друг"))
-    entries = await storage.list_entries()
-    assert len(entries) == 1
-    assert not entries[0].withdrawn
-
-
-@pytest.mark.anyio
-async def test_new_signup_is_refused_after_start_even_before_scheduler_closes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: a started event whose durable state has not yet switched to closed.
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    starts_at = datetime.datetime(2026, 9, 30, 19, 30)  # noqa: DTZ001
-    assert await storage.begin_event(starts_at, "manual")
-    await storage.activate_event(10, starts_at)
-    monkeypatch.setattr(Storage, "_now", lambda _: starts_at)
-    bot, publisher = _build_bot(storage, config)
-
-    # When: a new user or friend tries to join during the late-change window.
-    await _callback_handlers(bot)["cb_join"](_event(config, user_id=3))
-    await _message_handlers(bot)["add_friend"](_message(config, text="+ Новый"))
-
-    # Then: the grace period cannot be used for first-time registrations.
-    assert await storage.list_entries() == []
-    bot.api.users.get.assert_not_awaited()
-    publisher.edit_current.assert_not_awaited()
-    assert "Запись закрыта" in publisher.replace_current.await_args.kwargs["notice"]
-
-
-@pytest.mark.anyio
-async def test_text_failure_is_shown_in_republished_card(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    bot, publisher = _build_bot(storage, config)
-
-    await _message_handlers(bot)["sign_up"](_message(config, text="записаться"))
-
-    publisher.replace_current.assert_awaited_once_with(
-        notice="Запись закрыта. Дождись следующего анонса или нажми «Помощь»."
-    )
-    bot.api.users.get.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_signup_rejects_collection_changed_during_vk_lookup(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, 1)
-    bot, publisher = _build_bot(storage, config)
-
-    async def change_collection(**_kwargs: object) -> list[SimpleNamespace]:
-        await storage.close_registration()
-        await _open_event(storage, 2)
-        return [SimpleNamespace(first_name="Alice")]
-
-    bot.api.users.get = AsyncMock(side_effect=change_collection)
-    await _message_handlers(bot)["sign_up"](_message(config, text="записаться"))
-
-    assert await storage.list_entries() == []
-    notice = publisher.replace_current.await_args.kwargs["notice"]
-    assert "сбор изменился" in notice
-
-
-@pytest.mark.anyio
-async def test_friend_commands_and_views_keep_one_card(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, None)
-    bot, publisher = _build_bot(storage, config)
-    handlers = _message_handlers(bot)
-
-    await handlers["add_friend"](_message(config, text="+ Bob"))
-    await handlers["show_list"](_message(config, text="список"))
-    await handlers["help_cmd"](_message(config, text="помощь"))
-    await handlers["remove_friend"](_message(config, text="- Bob"))
-
-    assert await storage.list_entries() == []
-    assert publisher.replace_current.await_count == 4
-    assert publisher.replace_current.await_args.kwargs == {"notice": None}
-
-
-@pytest.mark.anyio
-async def test_callback_updates_card_and_uses_snackbar(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, None)
-    bot, publisher = _build_bot(storage, config)
-    handlers = _callback_handlers(bot)
-    event = _event(config)
-
-    await handlers["cb_join"](event)
-    await handlers["cb_help"](event)
-    await handlers["cb_leave"](event)
-
-    assert await storage.list_entries() == []
-    assert publisher.edit_current.await_count == 2
-    assert event.show_snackbar.await_count == 3
-
-
-@pytest.mark.anyio
-async def test_three_callbacks_keep_card_in_place_and_help_in_snackbar(
-    tmp_path: Path,
-) -> None:
-    # Given: a card with three inline actions and open registration.
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, None)
-    bot, publisher = _build_bot(storage, config)
-    handlers = _callback_handlers(bot)
-    assert set(handlers) == {"cb_join", "cb_leave", "cb_help"}
-    event = _event(config)
-
-    # When: a participant joins, asks for help, and leaves via the buttons.
-    await handlers["cb_join"](event)
-    assert [entry.name for entry in await storage.list_entries()] == ["Alice"]
-    publisher.edit_current.assert_awaited_once_with()
-    publisher.edit_current.reset_mock()
-    await handlers["cb_help"](event)
-
-    # Then: help explains how to bring the card last without republishing it.
-    assert (
-        "список — показать актуальную карточку в конце чата"
-        in (event.show_snackbar.await_args.args[0])
-    )
-    publisher.edit_current.assert_not_awaited()
-    await handlers["cb_leave"](event)
-    assert await storage.list_entries() == []
-    publisher.edit_current.assert_awaited_once_with()
-    publisher.replace_current.assert_not_awaited()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("command", ["список", "участники", "кто идёт"])
-async def test_list_command_republishes_card_with_current_participants(
-    tmp_path: Path,
-    command: str,
-) -> None:
-    # Given: an existing card with a participant, buried in the chat history.
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, 10)
-    await storage.add_friend("Друг")
-    before = await storage.list_entries()
-    bot = Bot(config.vk_token)
-    api = MagicMock()
-    api.messages.send = AsyncMock(return_value=20)
-    api.messages.delete = AsyncMock()
-    api.messages.edit = AsyncMock()
-    bot.api = api
-    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
-    message = _message(config, text=command)
-
-    # When: the participant requests the list using a supported text alias.
-    registered = next(
-        handler
-        for handler in bot.labeler.message_view.handlers
-        if handler.handler.__name__ == "show_list"
-    )
-    assert all([await rule.check(message) is not False for rule in registered.rules])
-    await registered.handler(message)
-
-    # Then: a fresh card contains the list and replaces the previous message.
-    api.messages.send.assert_awaited_once()
-    assert "1. Друг (друг)" in api.messages.send.await_args.kwargs["message"]
-    api.messages.delete.assert_awaited_once_with(
-        message_ids=[10],
-        delete_for_all=True,
-    )
-    assert (await storage.snapshot()).status_message_id == 20
-    assert await storage.list_entries() == before
-    api.messages.edit.assert_not_awaited()
-    message.answer.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_duplicate_callback_does_not_edit_unchanged_card(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, None)
-    bot, publisher = _build_bot(storage, config)
-    handler = _callback_handlers(bot)["cb_join"]
-    event = _event(config)
-
-    await handler(event)
-    await handler(event)
-
-    publisher.edit_current.assert_awaited_once_with()
-    assert event.show_snackbar.await_args_list[-1].args == ("Ты уже в списке.",)
-
-
-@pytest.mark.anyio
-async def test_admin_creates_manual_event_with_shared_publisher(
-    tmp_path: Path,
-) -> None:
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    bot, publisher = _build_bot(storage, config)
-    message = _message(
-        config,
-        text="создать событие 22.09.2099 19:30",
-        user_id=123,
-    )
-
-    with patch("src.bot.open_manual_event", new_callable=AsyncMock) as open_event:
-        await _message_handlers(bot)["admin_create_event"](message)
-
-    open_event.assert_awaited_once_with(
-        config,
-        storage,
-        datetime.datetime(2099, 9, 22, 19, 30),  # noqa: DTZ001
-        cards=publisher,
-    )
-    publisher.replace_current.assert_not_awaited()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("variant", ["exact", "capitalized", "padded_upper"])
-@pytest.mark.parametrize(
-    ("command", "action"),
-    [
-        ("записаться", "join"),
-        ("отписаться", "leave"),
-        ("-", "leave"),
-        ("+", "hint"),
-        ("список", "list"),
-        ("участники", "list"),
-        ("кто идёт", "list"),
-        ("?", "help"),
-        ("help", "help"),
-        ("помощь", "help"),
-        ("команды", "help"),
-    ],
-)
-async def test_user_commands_accept_case_and_outer_spaces_through_router(
-    tmp_path: Path,
-    command: str,
-    action: str,
-    variant: str,
-) -> None:
-    # Given: an open collection and a VK participant sending a documented command.
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, 10)
-    if action == "leave":
-        await storage.add_user(123, "Alice")
-    bot, publisher = _build_bot(storage, config)
-    if variant == "capitalized":
-        command = command[0].upper() + command[1:]
-    elif variant == "padded_upper":
-        command = f"  {command.upper()}  "
-
-    # When: the real router handles the message rather than a direct handler call.
-    await _route_admin_message(bot, config, command)
-
-    # Then: the command performs its action and publishes exactly one card.
-    publisher.replace_current.assert_awaited_once()
-    entries = await storage.list_entries()
-    if action == "join":
-        assert [entry.name for entry in entries] == ["Alice"]
-    else:
-        assert entries == []
-    if action == "help":
-        assert "список —" in publisher.replace_current.await_args.kwargs["notice"]
-    elif action == "hint":
-        assert (
-            "Чтобы записаться" in publisher.replace_current.await_args.kwargs["notice"]
+_NOW = datetime.datetime(2026, 10, 4, 18, 0)  # noqa: DTZ001
+_START = _NOW + datetime.timedelta(hours=1)
+type Channel = Literal["text", "button"]
+
+
+def _spellings(*commands: str) -> list[str]:
+    variants: list[str] = []
+    for command in commands:
+        prefix, separator, rest = command.partition(" ")
+        variants.extend(
+            (
+                command,
+                command[0].upper() + command[1:],
+                prefix.upper() + separator + rest,
+                f"  {prefix.upper()}{separator}{rest}  ",
+            )
+        )
+    return list(dict.fromkeys(variants))
+
+
+@dataclass
+class Chat:
+    config: Config
+    storage: Storage
+    bot: Bot
+    api: MagicMock
+    path: Path
+    now: datetime.datetime = _NOW
+
+    async def open_event(self) -> None:
+        assert await self.storage.begin_event(_START, "manual")
+        await self.storage.activate_event(10, _START, conversation_message_id=20)
+
+    async def saved(self) -> RegistrationSnapshot:
+        return await Storage(self.path).snapshot()
+
+    async def message(
+        self, text: str, *, user_id: int = 123, peer_id: int | None = None
+    ) -> None:
+        await self.bot.router.route(
+            {
+                "type": "message_new",
+                "group_id": 7,
+                "object": {
+                    "message": {
+                        "id": 1,
+                        "conversation_message_id": 1,
+                        "date": 1,
+                        "from_id": user_id,
+                        "peer_id": self.config.chat_peer_id
+                        if peer_id is None
+                        else peer_id,
+                        "out": 0,
+                        "text": text,
+                        "attachments": [],
+                        "fwd_messages": [],
+                        "version": 1,
+                    }
+                },
+            },
+            self.api,
         )
 
-
-@pytest.mark.anyio
-async def test_friend_commands_trim_edges_without_changing_name_case(
-    tmp_path: Path,
-) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    await _open_event(storage, 10)
-    bot, publisher = _build_bot(storage, config)
-    await _route_admin_message(bot, config, "  + АнНа ПЕТРОВА  ")
-    assert [entry.name for entry in await storage.list_entries()] == ["АнНа ПЕТРОВА"]
-    await _route_admin_message(bot, config, "  - АнНа ПЕТРОВА  ")
-    assert await storage.list_entries() == []
-    assert publisher.replace_current.await_count == 2
-
-
-async def _route_admin_message(
-    bot: Bot,
-    config: Config,
-    text: str,
-    *,
-    user_id: int = 123,
-    peer_id: int | None = None,
-) -> None:
-    """Deliver the same event shape as Bots Long Poll to the actual router."""
-    await bot.router.route(
-        {
-            "type": "message_new",
-            "group_id": 7,
-            "object": {
-                "message": {
-                    "id": 1,
-                    "version": 1,
-                    "conversation_message_id": 1,
-                    "date": 1,
-                    "from_id": user_id,
-                    "peer_id": config.chat_peer_id if peer_id is None else peer_id,
-                    "out": 0,
-                    "text": text,
-                    "attachments": [],
-                    "fwd_messages": [],
-                }
+    async def press(self, label: str, *, peer_id: int | None = None) -> None:
+        keyboard = json.loads(build_inline_keyboard())
+        action = next(
+            button["action"]
+            for row in keyboard["buttons"]
+            for button in row
+            if label.casefold() in button["action"]["label"].casefold()
+        )
+        await self.bot.router.route(
+            {
+                "type": "message_event",
+                "group_id": 7,
+                "object": {
+                    "event_id": "participant-click",
+                    "user_id": 123,
+                    "peer_id": self.config.chat_peer_id if peer_id is None else peer_id,
+                    "conversation_message_id": 20,
+                    "payload": action["payload"],
+                },
             },
-        },
-        bot.api,
-    )
+            self.api,
+        )
+
+    async def participant_action(self, label: str, channel: Channel) -> None:
+        if channel == "button":
+            await self.press(label)
+        else:
+            await self.message(label.lower())
+
+    def feedback(self, channel: Channel) -> str:
+        if channel == "button":
+            assert self.api.messages.send_message_event_answer.await_count == 1
+            answer = self.api.messages.send_message_event_answer.await_args.kwargs
+            return str(json.loads(answer["event_data"])["text"])
+        return str(self.api.messages.send.await_args.kwargs["message"])
+
+    def updated_card(self, channel: Channel) -> str:
+        operation = (
+            self.api.messages.edit if channel == "button" else self.api.messages.send
+        )
+        return str(operation.await_args.kwargs["message"])
 
 
-@pytest.mark.anyio
-@pytest.mark.parametrize("variant", ["exact", "capitalized", "upper_prefix", "padded"])
-@pytest.mark.parametrize(
-    ("command", "action"),
-    [
-        ("очистить", "clear"),
-        ("сбросить", "clear"),
-        ("убрать Bob", "remove"),
-        ("удалить Bob", "remove"),
-        ("админ помощь", "help"),
-        ("admin help", "help"),
-        ("статус события", "status"),
-        ("удалить событие", "delete_event"),
-        ("создать событие 22.09.2099 19:30", "create"),
-    ],
-)
-async def test_admin_commands_route_from_long_poll_and_perform_action(
-    tmp_path: Path,
-    command: str,
-    action: str,
-    variant: str,
-) -> None:
-    # Given: an allowed administrator in the configured chat and one participant.
+@pytest.fixture
+def chat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Chat:
     config = Config(
         vk_token=secrets.token_urlsafe(),
         chat_peer_id=2_000_000_001,
         admin_vk_ids=(123,),
+        collect_weekday=0,
+        collect_time="08:00",
+        event_weekday=1,
+        event_time="19:30",
+        remind_enabled=False,
     )
-    storage = Storage(tmp_path / "participants.json")
-    await storage.add_friend("Bob")
-    bot, publisher = _build_bot(storage, config)
-
-    if variant == "capitalized":
-        command = command[0].upper() + command[1:]
-    elif variant == "upper_prefix":
-        prefix, separator, rest = command.partition(" ")
-        command = prefix.upper() + separator + rest
-    elif variant == "padded":
-        command = f"  {command}  "
-
-    # When: VK delivers a documented command through the real routing pipeline.
-    with patch("src.bot.open_manual_event", new_callable=AsyncMock) as open_event:
-        await _route_admin_message(bot, config, command)
-
-    # Then: the command is deleted for everyone and feedback stays private.
-    bot.api.messages.delete.assert_awaited_once_with(
-        peer_id=config.chat_peer_id,
-        cmids=[1],
-        delete_for_all=True,
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    api = MagicMock()
+    api.users.get = AsyncMock(return_value=[SimpleNamespace(first_name="Alice")])
+    api.messages.send = AsyncMock(
+        return_value=[
+            MessagesSendUserIdsResponseItem(
+                peer_id=config.chat_peer_id,
+                message_id=30,
+                conversation_message_id=40,
+            )
+        ]
     )
-    publisher.replace_current.assert_not_awaited()
-    if action == "create":
-        open_event.assert_awaited_once()
-    elif action in {"clear", "remove"}:
-        publisher.edit_current.assert_awaited_once()
-        assert await storage.list_entries() == []
-    else:
-        bot.api.messages.send.assert_awaited_once()
-        assert bot.api.messages.send.await_args.kwargs["peer_id"] == 123
-        text = bot.api.messages.send.await_args.kwargs["message"]
-        if action == "help":
-            assert "Админ-команды" in text
-            assert "удалить событие" in text
-        elif action == "delete_event":
-            publisher.delete_event.assert_awaited_once()
-            assert text == "Событие удалено."
-        else:
-            publisher.diagnostic_notice.assert_awaited_once()
+    api.messages.edit = AsyncMock(return_value=1)
+    api.messages.delete = AsyncMock(return_value=[])
+    api.messages.send_message_event_answer = AsyncMock(return_value=1)
+    bot = Bot(config.vk_token)
+    bot.api = api
+    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
+    scenario = Chat(config, storage, bot, api, path)
+
+    class Clock(datetime.datetime):
+        @classmethod
+        def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+            return scenario.now.replace(tzinfo=tz)
+
+    monkeypatch.setattr(
+        scheduler,
+        "datetime",
+        SimpleNamespace(datetime=Clock, timedelta=datetime.timedelta),
+    )
+    monkeypatch.setattr(Storage, "_now", lambda _: scenario.now)
+    return scenario
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("записаться"))
+async def test_participant_signs_up_by_text(chat: Chat, command: str) -> None:
+    # Given: registration is open and another participant is already listed.
+    await chat.open_event()
+    await chat.storage.add_friend("Bob")
+    # When: the participant sends the signup command.
+    await chat.message(command)
+    # Then: their VK identity is saved and visible in one new last card.
+    entries = (await chat.saved()).participants
+    assert any(
+        e.kind == "user" and e.vk_id == 123 and e.name == "Alice" for e in entries
+    )
+    chat.api.messages.send.assert_awaited_once()
+    sent = chat.api.messages.send.await_args.kwargs
+    assert sent["peer_ids"] == [chat.config.chat_peer_id]
+    assert "Alice" in sent["message"]
+    chat.api.messages.delete.assert_awaited_once_with(
+        peer_id=chat.config.chat_peer_id, cmids=[20], delete_for_all=True
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("отписаться", "-"))
+async def test_registered_participant_leaves_by_text(chat: Chat, command: str) -> None:
+    # Given: the participant is listed one second before the event starts.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.add_friend("Bob")
+    chat.now = _START - datetime.timedelta(seconds=1)
+    # When: the participant sends a withdrawal command.
+    await chat.message(command)
+    # Then: only their row disappears from the saved list and the new card.
+    assert [e.name for e in (await chat.saved()).participants] == ["Bob"]
+    card = chat.updated_card("text")
+    assert "Bob" in card
+    assert "Alice" not in card
+
+
+@pytest.mark.anyio
+async def test_participant_presses_signup(chat: Chat) -> None:
+    # Given: the participant can see an open event's inline keyboard.
+    await chat.open_event()
+    # When: they press the signup action from the actual keyboard.
+    await chat.press("Записаться")
+    # Then: their identity is saved; the card updates with snackbar feedback.
+    assert any(
+        e.kind == "user" and e.vk_id == 123 for e in (await chat.saved()).participants
+    )
+    edited = chat.api.messages.edit.await_args.kwargs
+    assert edited["conversation_message_id"] == 20
+    assert "Alice" in edited["message"]
+    assert "записал" in chat.feedback("button")
+    chat.api.messages.send.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_registered_participant_presses_withdrawal(chat: Chat) -> None:
+    # Given: the participant is listed just before the event starts.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    chat.now = _START - datetime.timedelta(seconds=1)
+    # When: they press the withdrawal action from the actual keyboard.
+    await chat.press("Отписаться")
+    # Then: storage and the existing card exclude them, with snackbar feedback.
+    assert (await chat.saved()).participants == ()
+    assert "Alice" not in chat.updated_card("button")
+    assert "отписал" in chat.feedback("button")
+    chat.api.messages.send.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_participant_presses_help(chat: Chat) -> None:
+    # Given: an event card already exists and contains a participant.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    before = await chat.saved()
+    # When: the participant presses help from the actual keyboard.
+    await chat.press("Помощь")
+    # Then: snackbar guidance is shown without changing or republishing the card.
+    assert "список" in chat.feedback("button")
+    assert await chat.saved() == before
+    chat.api.messages.send.assert_not_awaited()
+    chat.api.messages.edit.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_listed_participant_presses_signup_again(chat: Chat) -> None:
+    # Given: the participant already belongs to this event.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    before = (await chat.saved()).participants
+    # When: they press signup again.
+    await chat.press("Записаться")
+    # Then: membership feedback is shown without a duplicate or new chat message.
+    assert (await chat.saved()).participants == before
+    assert "уже" in chat.feedback("button")
+    chat.api.messages.send.assert_not_awaited()
+    chat.api.messages.edit.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("+"))
+async def test_participant_requests_signup_guidance_with_bare_plus(
+    chat: Chat, command: str
+) -> None:
+    # Given: registration is open but the participant has not joined.
+    await chat.open_event()
+    # When: they send a plus without a friend's name.
+    await chat.message(command)
+    # Then: the card explains signup while the participant list stays empty.
+    assert (await chat.saved()).participants == ()
+    assert "записаться" in chat.updated_card("text").lower()
+    assert "+ Имя" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+async def test_participant_adds_friend_with_name_case_preserved(chat: Chat) -> None:
+    # Given: an open event with no friends yet.
+    await chat.open_event()
+    # When: the participant adds a friend with outer spaces and mixed name case.
+    await chat.message("  + АнНа ПЕТРОВА  ")
+    # Then: the trimmed name is saved as a friend and displayed with its case intact.
+    assert [(e.kind, e.name) for e in (await chat.saved()).participants] == [
+        ("friend", "АнНа ПЕТРОВА")
+    ]
+    assert "АнНа ПЕТРОВА (друг)" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+async def test_participant_removes_named_friend_before_start(chat: Chat) -> None:
+    # Given: two friends are listed before the event starts.
+    await chat.open_event()
+    await chat.storage.add_friend("АнНа ПЕТРОВА")
+    await chat.storage.add_friend("Bob")
+    # When: the participant removes one friend with outer whitespace.
+    await chat.message("  - АнНа ПЕТРОВА  ")
+    # Then: that friend alone disappears from storage and the card.
+    assert [e.name for e in (await chat.saved()).participants] == ["Bob"]
+    assert "АнНа" not in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("список", "участники", "кто идёт"))
+async def test_participant_requests_current_list(chat: Chat, command: str) -> None:
+    # Given: a participant's card is buried in chat history.
+    await chat.open_event()
+    await chat.storage.add_friend("Друг")
+    before = (await chat.saved()).participants
+    # When: a participant requests the list using a supported spelling.
+    await chat.message(command)
+    # Then: one new last card shows the same participants and replaces the old card.
+    chat.api.messages.send.assert_awaited_once()
+    assert "Друг (друг)" in chat.updated_card("text")
+    assert (await chat.saved()).participants == before
+    chat.api.messages.delete.assert_awaited_once_with(
+        peer_id=chat.config.chat_peer_id, cmids=[20], delete_for_all=True
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("?", "help", "помощь", "команды"))
+async def test_participant_requests_text_help(chat: Chat, command: str) -> None:
+    # Given: an open event with a participant.
+    await chat.open_event()
+    await chat.storage.add_friend("Друг")
+    before = (await chat.saved()).participants
+    # When: a participant requests help using a supported spelling.
+    await chat.message(command)
+    # Then: one card includes signup/friend guidance and preserves attendance.
+    chat.api.messages.send.assert_awaited_once()
+    text = chat.updated_card("text")
+    assert "записаться" in text
+    assert "+ Имя" in text
+    assert (await chat.saved()).participants == before
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+async def test_participant_attempts_signup_before_announcement(
+    chat: Chat, channel: Channel
+) -> None:
+    # Given: the event has not been announced and registration is closed.
+    before = (await chat.saved()).participants
+    # When: a participant tries to sign up.
+    await chat.participant_action("Записаться", channel)
+    # Then: registration is refused with visible guidance and no saved participant.
+    assert (await chat.saved()).participants == before
+    assert "Запись закрыта" in chat.feedback(channel)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("seconds", [0, 1799])
+async def test_registered_participant_withdraws_during_grace_period(
+    chat: Chat, channel: Channel, closed: bool, seconds: int
+) -> None:
+    # Given: start has elapsed, with or without the scheduler's close transition.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.add_user(456, "Bob")
+    if closed:
+        await chat.storage.close_registration()
+    chat.now = _START + datetime.timedelta(seconds=seconds)
+    # When: the listed participant withdraws during the first half hour.
+    await chat.participant_action("Отписаться", channel)
+    # Then: their saved row is marked at the bottom and the displayed count decreases.
+    entries = (await chat.saved()).participants
+    assert [e.name for e in entries] == ["Bob", "Alice"]
+    assert entries[-1].withdrawn
+    card = chat.updated_card(channel)
+    assert "Alice (-)" in card
+    assert "Участники: 1" in card
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+async def test_withdrawn_participant_returns_during_grace_period(
+    chat: Chat, channel: Channel
+) -> None:
+    # Given: two participants withdrew after start while a friend stayed active.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.add_user(456, "Bob")
+    await chat.storage.add_friend("Друг")
+    await chat.storage.close_registration()
+    chat.now = _START + datetime.timedelta(minutes=10)
+    assert await chat.storage.withdraw_user(123)
+    assert await chat.storage.withdraw_user(456)
+    # When: the withdrawn participant signs up again within the grace period.
+    await chat.participant_action("Записаться", channel)
+    # Then: the same identity is active above withdrawn rows and the count is restored.
+    entries = (await chat.saved()).participants
+    assert [e.name for e in entries] == ["Друг", "Alice", "Bob"]
+    assert [e.withdrawn for e in entries] == [False, False, True]
+    assert entries[1].kind == "user"
+    assert entries[1].vk_id == 123
+    assert "Alice (-)" not in chat.updated_card(channel)
+    assert "Участники: 2" in chat.updated_card(channel)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+@pytest.mark.parametrize("seconds", [1800, 1801, 86400])
+async def test_registered_participant_cannot_withdraw_after_grace_period(
+    chat: Chat, channel: Channel, seconds: int
+) -> None:
+    # Given: registration is closed and the withdrawal window has ended.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.close_registration()
+    chat.now = _START + datetime.timedelta(seconds=seconds)
+    before = (await chat.saved()).participants
+    # When: the participant attempts to withdraw.
+    await chat.participant_action("Отписаться", channel)
+    # Then: visible refusal preserves their final attendance row.
+    assert (await chat.saved()).participants == before
+    assert "30 минут" in chat.feedback(channel)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+@pytest.mark.parametrize("seconds", [1800, 1801, 86400])
+async def test_withdrawn_participant_cannot_return_after_grace_period(
+    chat: Chat, channel: Channel, seconds: int
+) -> None:
+    # Given: a withdrawn row and an expired grace period.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.close_registration()
+    chat.now = _START
+    assert await chat.storage.withdraw_user(123)
+    chat.now = _START + datetime.timedelta(seconds=seconds)
+    before = (await chat.saved()).participants
+    # When: the participant attempts to return.
+    await chat.participant_action("Записаться", channel)
+    # Then: the minus remains saved and the participant receives an explicit refusal.
+    assert (await chat.saved()).participants == before
+    assert "30 минут" in chat.feedback(channel)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+async def test_new_participant_cannot_join_started_event(
+    chat: Chat, channel: Channel
+) -> None:
+    # Given: the event started but its durable state has not yet been closed.
+    await chat.open_event()
+    chat.now = _START
+    # When: a new participant attempts to join through one interface.
+    await chat.participant_action("Записаться", channel)
+    # Then: the grace period cannot add a new identity and refusal is visible.
+    assert (await chat.saved()).participants == ()
+    assert "Запись закрыта" in chat.feedback(channel)
+
+
+@pytest.mark.anyio
+async def test_participant_cannot_add_new_friend_after_start(chat: Chat) -> None:
+    # Given: an event that has just started.
+    await chat.open_event()
+    chat.now = _START
+    # When: a participant attempts to add a new friend.
+    await chat.message("+ Новый")
+    # Then: the friend is not saved and the card explains that registration is closed.
+    assert (await chat.saved()).participants == ()
+    assert "Запись закрыта" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+async def test_participant_withdraws_friend_during_grace_period(chat: Chat) -> None:
+    # Given: a friend and a VK participant are listed in a started event.
+    await chat.open_event()
+    await chat.storage.add_friend("Друг")
+    await chat.storage.add_user(456, "Bob")
+    await chat.storage.close_registration()
+    chat.now = _START + datetime.timedelta(minutes=5)
+    # When: a participant withdraws the friend by name.
+    await chat.message("- Друг")
+    # Then: the saved friend moves to the bottom with a minus, excluded from count.
+    entries = (await chat.saved()).participants
+    assert [e.name for e in entries] == ["Bob", "Друг"]
+    assert entries[-1].withdrawn
+    assert "Друг (-) (друг)" in chat.updated_card("text")
+    assert "Участники: 1" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+async def test_participant_restores_withdrawn_friend_during_grace_period(
+    chat: Chat,
+) -> None:
+    # Given: a friend's row was marked after the event started.
+    await chat.open_event()
+    await chat.storage.add_friend("Друг")
+    await chat.storage.close_registration()
+    chat.now = _START + datetime.timedelta(minutes=5)
+    assert await chat.storage.withdraw_friend("Друг")
+    # When: the participant adds that friend again.
+    await chat.message("+ Друг")
+    # Then: the existing row is active without a duplicate or minus in the card.
+    entries = (await chat.saved()).participants
+    assert len(entries) == 1
+    assert entries[0].name == "Друг"
+    assert not entries[0].withdrawn
+    assert "Друг (-)" not in chat.updated_card("text")
+    assert "Участники: 1" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", ["- Друг", "+ Друг"])
+@pytest.mark.parametrize("seconds", [1800, 1801, 86400])
+async def test_participant_cannot_change_friend_after_grace_period(
+    chat: Chat, command: str, seconds: int
+) -> None:
+    # Given: a friend's final row and an expired withdrawal/return window.
+    await chat.open_event()
+    await chat.storage.add_friend("Друг")
+    await chat.storage.close_registration()
+    chat.now = _START
+    if command.startswith("+"):
+        assert await chat.storage.withdraw_friend("Друг")
+    before = (await chat.saved()).participants
+    chat.now = _START + datetime.timedelta(seconds=seconds)
+    # When: a participant attempts one late change to the friend.
+    await chat.message(command)
+    # Then: the final row stays saved and the card explains the time limit.
+    assert (await chat.saved()).participants == before
+    assert "30 минут" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("channel", ["text", "button"])
+async def test_withdrawn_participant_repeats_withdrawal(
+    chat: Chat, channel: Channel
+) -> None:
+    # Given: the participant already withdrew during the grace period.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.close_registration()
+    chat.now = _START
+    assert await chat.storage.withdraw_user(123)
+    before = (await chat.saved()).participants
+    # When: they repeat the withdrawal request.
+    await chat.participant_action("Отписаться", channel)
+    # Then: the existing withdrawn row retains its order and identity.
+    assert (await chat.saved()).participants == before
+
+
+@pytest.mark.anyio
+async def test_participant_signup_cannot_leak_into_next_event(chat: Chat) -> None:
+    # Given: VK responds to a profile lookup after the event has changed.
+    await chat.open_event()
+
+    async def change_event(**_kwargs: object) -> list[SimpleNamespace]:
+        await chat.storage.close_registration()
+        assert await chat.storage.begin_event(_START, "weekly")
+        await chat.storage.activate_event(10, _START, conversation_message_id=20)
+        return [SimpleNamespace(first_name="Alice")]
+
+    chat.api.users.get.side_effect = change_event
+    # When: the participant signs up while the delayed lookup is in flight.
+    await chat.message("записаться")
+    # Then: the new event stays empty and the participant learns the collection changed.
+    assert (await chat.saved()).participants == ()
+    assert "сбор изменился" in chat.updated_card("text")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("создать событие 04.10.2026 19:00"))
+async def test_admin_creates_manual_event(chat: Chat, command: str) -> None:
+    # Given: prior attendance and a requested start before Monday's announcement.
+    await chat.storage.add_friend("Previous")
+    # When: the administrator creates the event through Long Poll.
+    await chat.message(command)
+    # Then: an empty open manual event and its displayed deadline are durably saved.
+    saved = await chat.saved()
+    assert saved.state == "open"
+    assert saved.event_source == "manual"
+    assert saved.event_starts_at == _START
+    assert saved.participants == ()
+    assert saved.status_conversation_message_id == 40
+    chat.api.messages.send.assert_awaited_once()
+    sent = chat.api.messages.send.await_args.kwargs
+    assert sent["peer_ids"] == [chat.config.chat_peer_id]
+    assert "19:00" in sent["message"]
+    assert "запись открыта" in sent["message"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("очистить", "сбросить"))
+async def test_admin_clears_event_participants(chat: Chat, command: str) -> None:
+    # Given: an open event with multiple participants.
+    await chat.open_event()
+    await chat.storage.add_friend("Bob")
+    await chat.storage.add_friend("Друг")
+    # When: the administrator clears the participant list.
+    await chat.message(command)
+    # Then: the event stays open while attendance is empty in storage and its card.
+    saved = await chat.saved()
+    assert saved.participants == ()
+    assert saved.state == "open"
+    assert saved.event_starts_at == _START
+    assert "Участники: 0" in chat.updated_card("button")
+    chat.api.messages.send.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("убрать Bob", "удалить Bob"))
+async def test_admin_removes_only_named_participant(chat: Chat, command: str) -> None:
+    # Given: Bob and another participant share an open event.
+    await chat.open_event()
+    await chat.storage.add_friend("Bob")
+    await chat.storage.add_user(456, "Alice")
+    # When: the administrator removes Bob by name.
+    await chat.message(command)
+    # Then: Alice remains saved and visible while Bob alone is removed.
+    assert [e.name for e in (await chat.saved()).participants] == ["Alice"]
+    card = chat.updated_card("button")
+    assert "Alice" in card
+    assert "Bob" not in card
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("админ помощь", "admin help"))
+async def test_admin_requests_private_help(chat: Chat, command: str) -> None:
+    # Given: an existing event and an authorized administrator.
+    await chat.open_event()
+    before = await chat.saved()
+    # When: the administrator requests command guidance.
+    await chat.message(command)
+    # Then: the command disappears and private guidance leaves the card unchanged.
+    chat.api.messages.delete.assert_awaited_once_with(
+        peer_id=chat.config.chat_peer_id, cmids=[1], delete_for_all=True
+    )
+    chat.api.messages.send.assert_awaited_once()
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == 123
+    assert "Админ-команды" in reply["message"]
+    assert await chat.saved() == before
+    chat.api.messages.edit.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("статус события"))
+async def test_admin_requests_private_event_status(chat: Chat, command: str) -> None:
+    # Given: a persisted manual event with a known deadline and card.
+    await chat.open_event()
+    before = await chat.saved()
+    # When: the administrator requests its status.
+    await chat.message(command)
+    # Then: real event details arrive privately without changing the event.
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == 123
+    assert "open" in reply["message"]
+    assert "04.10.2026 19:00" in reply["message"]
+    assert "cmid: 20" in reply["message"]
+    assert await chat.saved() == before
+    chat.api.messages.edit.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("удалить событие"))
+async def test_admin_deletes_event_after_removing_command(
+    chat: Chat, command: str
+) -> None:
+    # Given: an open event and a friend named exactly like the command's noun.
+    await chat.open_event()
+    await chat.storage.add_friend("событие")
+    # When: the administrator deletes the event through the router.
+    await chat.message(command)
+    # Then: command and card are deleted in order and cancellation survives restart.
+    assert [c.kwargs["cmids"] for c in chat.api.messages.delete.await_args_list] == [
+        [1],
+        [20],
+    ]
+    saved = await chat.saved()
+    assert saved.state == "closed"
+    assert saved.participants == ()
+    assert saved.event_starts_at is None
+    assert saved.status_message_id is None
+    assert saved.status_conversation_message_id is None
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == 123
+    assert "удалено" in reply["message"]
 
 
 @pytest.mark.anyio
@@ -604,98 +714,70 @@ async def test_admin_commands_route_from_long_poll_and_perform_action(
         "админ помощь",
         "статус события",
         "удалить событие",
-        "создать событие 22.09.2099 19:30",
+        "создать событие 04.10.2026 19:00",
     ],
 )
-@pytest.mark.parametrize(("admin_ids", "user_id"), [((123,), 999), ((), 123)])
-async def test_all_admin_actions_deny_unlisted_user_through_router(
-    tmp_path: Path,
-    command: str,
-    admin_ids: tuple[int, ...],
-    user_id: int,
+@pytest.mark.parametrize(("admins", "requester"), [((123,), 999), ((), 123)])
+async def test_unlisted_participant_is_denied_admin_command(
+    chat: Chat, command: str, admins: tuple[int, ...], requester: int
 ) -> None:
-    # Given: a chat participant who is not listed in ADMIN_VK_IDS_RAW.
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=admin_ids,
+    # Given: an event and a requester outside the configured admin list.
+    chat.config.admin_vk_ids = admins
+    await chat.open_event()
+    await chat.storage.add_friend("Bob")
+    before = await chat.saved()
+    # When: that participant sends a protected command through the router.
+    await chat.message(command, user_id=requester)
+    # Then: private denial and command deletion leave the entire event untouched.
+    assert await chat.saved() == before
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == requester
+    assert "Только администраторы" in reply["message"]
+    chat.api.messages.delete.assert_awaited_once_with(
+        peer_id=chat.config.chat_peer_id, cmids=[1], delete_for_all=True
     )
-    storage = Storage(tmp_path / "participants.json")
-    await storage.add_friend("Bob")
-    before = await storage.snapshot()
-    bot, publisher = _build_bot(storage, config)
-    # When: any admin command is delivered by VK from that participant.
-    with patch("src.bot.open_manual_event", new_callable=AsyncMock) as open_event:
-        await _route_admin_message(bot, config, command, user_id=user_id)
-    # Then: it produces an explicit denial and leaves the event untouched.
-    publisher.replace_current.assert_not_awaited()
-    bot.api.messages.delete.assert_awaited_once()
-    assert "Только администраторы" in bot.api.messages.send.await_args.kwargs["message"]
-    publisher.delete_event.assert_not_awaited()
-    open_event.assert_not_awaited()
-    publisher.diagnostic_notice.assert_not_awaited()
-    assert await storage.snapshot() == before
-
-
-@pytest.mark.anyio
-async def test_admin_status_is_sent_privately(tmp_path: Path) -> None:
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    bot, publisher = _build_bot(storage, config)
-
-    await _message_handlers(bot)["admin_event_status"](
-        _message(config, text="статус события", user_id=123)
-    )
-
-    publisher.diagnostic_notice.assert_awaited_once_with()
-    publisher.replace_current.assert_not_awaited()
-    assert bot.api.messages.send.await_args.kwargs["message"] == "Состояние: open"
-    assert bot.api.messages.send.await_args.kwargs["peer_id"] == 123
+    chat.api.messages.edit.assert_not_awaited()
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "command",
     [
-        "Очистить",
-        "Убрать Bob",
-        "Админ помощь",
-        "Статус события",
-        "Удалить событие",
-        "Создать событие 22.09.2099 19:30",
+        "очистить",
+        "убрать Bob",
+        "админ помощь",
+        "статус события",
+        "удалить событие",
+        "создать событие 04.10.2026 19:00",
+        "записаться",
+        "+ Друг",
+        "список",
     ],
 )
-async def test_admin_commands_from_another_chat_do_not_touch_data(
-    tmp_path: Path,
-    command: str,
+async def test_requester_in_another_chat_is_ignored(chat: Chat, command: str) -> None:
+    # Given: an existing event in the configured chat.
+    await chat.open_event()
+    before = await chat.saved()
+    # When: the same requester sends a command from another chat.
+    await chat.message(command, peer_id=chat.config.chat_peer_id + 1)
+    # Then: neither the saved event nor any VK response surface is touched.
+    assert await chat.saved() == before
+    assert chat.api.mock_calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("label", ["Записаться", "Отписаться", "Помощь"])
+async def test_participant_callback_in_another_chat_is_ignored(
+    chat: Chat, label: str
 ) -> None:
-    # Given: an authorized admin sending a command from an unconfigured chat.
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    await storage.add_friend("Bob")
-    before = await storage.snapshot()
-    bot, publisher = _build_bot(storage, config)
-    # When: the actual router receives an admin command from that chat.
-    with patch("src.bot.open_manual_event", new_callable=AsyncMock) as open_event:
-        await _route_admin_message(
-            bot, config, command, peer_id=config.chat_peer_id + 1
-        )
-    # Then: no admin action or visible response is performed.
-    bot.api.messages.delete.assert_not_awaited()
-    bot.api.messages.send.assert_not_awaited()
-    publisher.delete_event.assert_not_awaited()
-    open_event.assert_not_awaited()
-    publisher.replace_current.assert_not_awaited()
-    publisher.diagnostic_notice.assert_not_awaited()
-    assert await storage.snapshot() == before
+    # Given: an existing event in the configured chat.
+    await chat.open_event()
+    before = await chat.saved()
+    # When: a real callback payload arrives from a different chat.
+    await chat.press(label, peer_id=chat.config.chat_peer_id + 1)
+    # Then: the event is unchanged with no VK response or profile lookup.
+    assert await chat.saved() == before
+    assert chat.api.mock_calls == []
 
 
 @pytest.mark.anyio
@@ -705,189 +787,75 @@ async def test_admin_commands_from_another_chat_do_not_touch_data(
         ("Создать событие", "Формат:"),
         ("Создать событие завтра", "Формат:"),
         ("Создать событие 01.01.2000 00:00", "должно быть в будущем"),
+        ("Создать событие 05.10.2026 08:00", "пересекается"),
     ],
 )
-async def test_invalid_admin_event_command_shows_error_instead_of_silence(
-    tmp_path: Path,
-    command: str,
-    notice: str,
+async def test_admin_invalid_event_request_preserves_existing_data(
+    chat: Chat, command: str, notice: str
 ) -> None:
-    # Given: an administrator with existing participant data.
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    await storage.add_friend("Bob")
-    before = await storage.snapshot()
-    bot, publisher = _build_bot(storage, config)
-    # When: VK delivers an incomplete, malformed, or expired event command.
-    await _route_admin_message(bot, config, command)
-    # Then: the error is visible and the stored event is preserved.
-    publisher.replace_current.assert_not_awaited()
-    bot.api.messages.delete.assert_awaited_once()
-    assert notice in bot.api.messages.send.await_args.kwargs["message"]
-    assert await storage.snapshot() == before
+    # Given: prior attendance that must survive an invalid event request.
+    await chat.storage.add_friend("Bob")
+    before = await chat.saved()
+    # When: the administrator requests an invalid or overlapping deadline.
+    await chat.message(command)
+    # Then: a private error explains rejection and durable data stays unchanged.
+    assert await chat.saved() == before
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == 123
+    assert notice in reply["message"]
 
 
 @pytest.mark.anyio
-async def test_admin_commands_reject_non_admin_without_mutation(
-    tmp_path: Path,
-) -> None:
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    await storage.add_friend("Bob")
-    bot, publisher = _build_bot(storage, config)
-
-    await _message_handlers(bot)["admin_clear"](
-        _message(config, text="очистить", user_id=999)
-    )
-
-    assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
-    publisher.replace_current.assert_not_awaited()
-    assert "Только администраторы" in bot.api.messages.send.await_args.kwargs["message"]
+async def test_admin_cannot_create_event_over_active_registration(chat: Chat) -> None:
+    # Given: another event is already accepting participants.
+    await chat.open_event()
+    before = await chat.saved()
+    # When: the administrator requests another otherwise valid event.
+    await chat.message("создать событие 04.10.2026 19:15")
+    # Then: private rejection preserves the current event instead of replacing it.
+    assert await chat.saved() == before
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == 123
+    assert "активное событие" in reply["message"]
 
 
 @pytest.mark.anyio
-async def test_handlers_ignore_other_peer_before_any_action(tmp_path: Path) -> None:
-    config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
-    storage = Storage(tmp_path / "participants.json")
-    bot, publisher = _build_bot(storage, config)
-    message = _message(config, text="записаться")
-    message.peer_id += 1
-    event = _event(config)
-    event.peer_id += 1
-
-    await _message_handlers(bot)["sign_up"](message)
-    await _callback_handlers(bot)["cb_join"](event)
-
-    assert await storage.list_entries() == []
-    bot.api.users.get.assert_not_awaited()
-    publisher.replace_current.assert_not_awaited()
-    publisher.edit_current.assert_not_awaited()
-    event.show_snackbar.assert_not_awaited()
+async def test_admin_private_help_delivery_failure_keeps_chat_private(
+    chat: Chat,
+) -> None:
+    # Given: VK refuses private delivery to the administrator.
+    await chat.open_event()
+    before = await chat.saved()
+    chat.api.messages.send.side_effect = OSError("private messages disabled")
+    # When: the administrator requests help.
+    await chat.message("админ помощь")
+    # Then: the command is deleted without guidance leaking into the public card.
+    assert await chat.saved() == before
+    chat.api.messages.delete.assert_awaited_once()
+    chat.api.messages.edit.assert_not_awaited()
+    chat.api.messages.send.assert_awaited_once()
+    assert chat.api.messages.send.await_args.kwargs["peer_id"] == 123
 
 
 @pytest.mark.anyio
-async def test_delete_event_through_router_removes_command_before_event(
-    tmp_path: Path,
+@pytest.mark.parametrize("refusal", ["network", "individual"])
+async def test_admin_command_deletion_failure_still_performs_requested_action(
+    chat: Chat, refusal: str
 ) -> None:
-    # Given: an open event and a friend literally named "событие".
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    starts_at = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
-    assert await storage.begin_event(starts_at, "manual")
-    await storage.activate_event(10, starts_at, conversation_message_id=20)
-    await storage.add_friend("событие")
-    bot = Bot(config.vk_token)
-    api = MagicMock()
-    api.messages.send = AsyncMock(return_value=1)
-    deletions: list[list[int]] = []
-
-    async def delete(**kwargs: object) -> list[object]:
-        cmids = kwargs["cmids"]
-        assert isinstance(cmids, list)
-        deletions.append(cmids)
-        if cmids == [1]:
-            assert (await storage.snapshot()).state == "open"
-            assert len(await storage.list_entries()) == 1
-        else:
-            assert (await storage.snapshot()).state == "closed"
-        return []
-
-    api.messages.delete = AsyncMock(side_effect=delete)
-    bot.api = api
-    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
-
-    # When: the command arrives through Long Poll with case and outer spaces.
-    await _route_admin_message(bot, config, "  УДАЛИТЬ СОБЫТИЕ  ")
-
-    # Then: the command disappears first, followed by the entire event card.
-    assert deletions == [[1], [20]]
-    snapshot = await storage.snapshot()
-    assert snapshot.state == "closed"
-    assert snapshot.event_starts_at is None
-    assert not snapshot.participants
-    assert snapshot.status_message_id is None
-    api.messages.send.assert_awaited_once()
-    assert api.messages.send.await_args.kwargs["peer_id"] == 123
-    assert api.messages.send.await_args.kwargs["message"] == "Событие удалено."
-
-
-@pytest.mark.anyio
-async def test_private_help_failure_does_not_expose_help_in_card(
-    tmp_path: Path,
-) -> None:
-    # Given: VK forbids the community from messaging the administrator privately.
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    bot, publisher = _build_bot(storage, config)
-    bot.api.messages.send.side_effect = OSError("private messages disabled")
-
-    # When: the admin requests help.
-    await _route_admin_message(bot, config, "Админ помощь")
-
-    # Then: the command is deleted and private help never leaks into the chat.
-    bot.api.messages.delete.assert_awaited_once()
-    bot.api.messages.send.assert_awaited_once()
-    publisher.replace_current.assert_not_awaited()
-    publisher.edit_current.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_command_delete_failure_warns_privately_and_still_runs_action(
-    tmp_path: Path,
-) -> None:
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    await storage.add_friend("Друг")
-    bot, publisher = _build_bot(storage, config)
-    bot.api.messages.delete.side_effect = OSError("missing chat administrator rights")
-    await _route_admin_message(bot, config, "Очистить")
-    assert not await storage.list_entries()
-    publisher.edit_current.assert_awaited_once()
-    assert "права администратора" in bot.api.messages.send.await_args.kwargs["message"]
-    assert bot.api.messages.send.await_args.kwargs["peer_id"] == 123
-    publisher.replace_current.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_vk_individual_command_delete_refusal_warns_privately(
-    tmp_path: Path,
-) -> None:
-    config = Config(
-        vk_token=secrets.token_urlsafe(),
-        chat_peer_id=2_000_000_001,
-        admin_vk_ids=(123,),
-    )
-    storage = Storage(tmp_path / "participants.json")
-    bot, publisher = _build_bot(storage, config)
-    bot.api.messages.delete.return_value = [
-        MessagesDeleteFullResponseItem(conversation_message_id=1, response=False)
-    ]
-    await _route_admin_message(bot, config, "админ помощь")
-    assert bot.api.messages.send.await_count == 2
-    assert (
-        "права администратора"
-        in bot.api.messages.send.await_args_list[0].kwargs["message"]
-    )
-    assert "Админ-команды" in bot.api.messages.send.await_args_list[1].kwargs["message"]
-    publisher.replace_current.assert_not_awaited()
-    publisher.edit_current.assert_not_awaited()
+    # Given: attendance and a VK refusal to delete the administrator's command.
+    await chat.open_event()
+    await chat.storage.add_friend("Друг")
+    if refusal == "network":
+        chat.api.messages.delete.side_effect = OSError("missing administrator rights")
+    else:
+        chat.api.messages.delete.return_value = [
+            MessagesDeleteFullResponseItem(message_id=1, response=False)
+        ]
+    # When: the administrator clears attendance despite that refusal.
+    await chat.message("очистить")
+    # Then: attendance is cleared and the deletion warning is delivered privately.
+    assert (await chat.saved()).participants == ()
+    assert "Участники: 0" in chat.updated_card("button")
+    reply = chat.api.messages.send.await_args.kwargs
+    assert reply["peer_id"] == 123
+    assert "права администратора" in reply["message"]

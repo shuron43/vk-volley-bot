@@ -1,8 +1,9 @@
-"""BDD scenarios for resolving configuration IDs without touching bot state."""
+"""Focused setup scenarios and separate CLI/Long Poll infrastructure contracts."""
 
 from __future__ import annotations
 
 import secrets
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -21,6 +22,45 @@ from src.vk_ids import (
 from vkbottle.api import API
 
 
+@pytest.fixture
+def vk_api(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    monkeypatch.setenv("VK_TOKEN", secrets.token_urlsafe())
+    api = MagicMock(spec=API)
+    api.http_client = MagicMock()
+    api.http_client.close = AsyncMock()
+    monkeypatch.setattr("src.vk_ids.API", MagicMock(return_value=api))
+    return api
+
+
+def _poll_server(api: MagicMock) -> None:
+    api.groups.get_by_id = AsyncMock(
+        return_value=SimpleNamespace(groups=[SimpleNamespace(id=7, name="Волейбол")])
+    )
+    api.groups.get_long_poll_server = AsyncMock(
+        return_value=SimpleNamespace(
+            server="https://lp.vk.com/test", key="initial-key", ts="1"
+        )
+    )
+
+
+def _probe_batch(peer_id: int, ts: str) -> dict[str, object]:
+    return {
+        "ts": ts,
+        "updates": [
+            {
+                "type": "message_new",
+                "object": {
+                    "message": {
+                        "peer_id": peer_id,
+                        "from_id": 123,
+                        "text": "vk-peer-abcdef",
+                    }
+                },
+            }
+        ],
+    }
+
+
 @pytest.mark.parametrize(
     ("profile", "expected"),
     [
@@ -34,11 +74,7 @@ from vkbottle.api import API
     ],
 )
 def test_profile_input_resolves_to_api_identifier(profile: str, expected: str) -> None:
-    # Given: a profile link or a user identifier copied from VK.
-    # When: it is prepared for users.get.
-    result = profile_identifier(profile)
-    # Then: the API receives only the ID or screen name.
-    assert result == expected
+    assert profile_identifier(profile) == expected
 
 
 @pytest.mark.parametrize(
@@ -60,23 +96,14 @@ def test_invalid_profile_is_rejected(profile: str) -> None:
         ("probe", 2_000_000_042, -123, None),
     ],
 )
-def test_probe_identifies_only_direct_message_in_target_chat(
-    text: str,
-    peer_id: int,
-    from_id: int,
-    expected: ChatIds | None,
+def test_probe_accepts_only_matching_group_message(
+    text: str, peer_id: int, from_id: int, expected: ChatIds | None
 ) -> None:
-    # Given: a message delivered to the community, including private/wrong messages.
     update = PollUpdate(
         type="message_new",
-        object={
-            "message": {"text": text, "peer_id": peer_id, "from_id": from_id},
-        },
+        object={"message": {"text": text, "peer_id": peer_id, "from_id": from_id}},
     )
-    # When: the exact probe is checked.
-    result = probe_ids(update, "probe")
-    # Then: only the group chat's own peer_id and personal author ID are returned.
-    assert result == expected
+    assert probe_ids(update, "probe") == expected
 
 
 def test_non_message_event_is_ignored() -> None:
@@ -84,185 +111,168 @@ def test_non_message_event_is_ignored() -> None:
 
 
 def test_token_settings_do_not_require_chat_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Given: setup is incomplete and no application config can be loaded.
     token = secrets.token_urlsafe()
     monkeypatch.setenv("VK_TOKEN", token)
     monkeypatch.delenv("CHAT_PEER_ID", raising=False)
-    # When: the lookup settings are loaded without reading a user's .env.
     settings = TokenSettings(_env_file=None)
-    # Then: only the secret token is required and its repr does not expose it.
     assert settings.vk_token.get_secret_value() == token
     assert token not in repr(settings)
 
 
 @pytest.mark.anyio
-async def test_users_are_named_and_resolved_before_admin_line(
-    capsys: pytest.CaptureFixture[str],
+async def test_profile_resolution_preserves_identity_and_deduplicates_ids(
+    vk_api: MagicMock,
 ) -> None:
-    api = MagicMock(spec=API)
-    api.users.get = AsyncMock(
-        return_value=[
-            MagicMock(id=123, first_name="Имя", last_name="Фамилия"),
-        ]
+    vk_api.users.get = AsyncMock(
+        return_value=[SimpleNamespace(id=123, first_name="Имя", last_name="Фамилия")]
     )
-    result = await resolve_users(api, ["https://vk.com/person", "id123"])
+    result = await resolve_users(vk_api, ["https://vk.com/person", "id123"])
     assert result == [123]
-    assert api.users.get.await_args_list[0].kwargs == {"user_ids": ["person"]}
-    assert "Имя Фамилия — 123" in capsys.readouterr().out
+    assert [call.kwargs["user_ids"] for call in vk_api.users.get.await_args_list] == [
+        ["person"],
+        ["123"],
+    ]
 
 
 @pytest.mark.anyio
-async def test_missing_user_does_not_silently_become_admin() -> None:
-    api = MagicMock(spec=API)
-    api.users.get = AsyncMock(return_value=[])
-    with pytest.raises(ValueError, match="Не найден пользователь"):
-        await resolve_users(api, ["missing"])
+async def test_setup_operator_resolves_admin_profiles(
+    vk_api: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Given: two requested VK profiles and their real API response shapes.
+    token = secrets.token_urlsafe()
+    monkeypatch.setenv("VK_TOKEN", token)
+    vk_api.users.get = AsyncMock(
+        side_effect=[
+            [SimpleNamespace(id=123, first_name="Алиса", last_name="Первая")],
+            [SimpleNamespace(id=456, first_name="Борис", last_name="Второй")],
+        ]
+    )
+
+    # When: the operator requests administrator IDs.
+    await run("users", ["https://vk.com/alice", "id456"], 1)
+
+    # Then: both named profiles precede a ready config line, without the token.
+    output = capsys.readouterr().out
+    config_position = output.index("ADMIN_VK_IDS_RAW=123,456")
+    assert output.index("Алиса Первая") < config_position
+    assert output.index("Борис Второй") < config_position
+    assert token not in output
+
+
+@pytest.mark.anyio
+async def test_setup_operator_requests_missing_admin_profile(
+    vk_api: MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Given: VK cannot resolve the requested profile.
+    vk_api.users.get = AsyncMock(return_value=[])
+
+    # When: the operator requests its administrator ID.
+    with pytest.raises(ValueError, match="Не найден пользователь: missing"):
+        await run("users", ["missing"], 1)
+
+    # Then: the missing identity is rejected without a usable admin config line.
+    assert "ADMIN_VK_IDS_RAW=" not in capsys.readouterr().out
+
+
+@pytest.mark.anyio
+async def test_setup_operator_identifies_chat_after_private_probe(
+    vk_api: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Given: initialized community Long Poll with a private probe before a chat probe.
+    token = secrets.token_urlsafe()
+    monkeypatch.setenv("VK_TOKEN", token)
+    monkeypatch.setattr("src.vk_ids.secrets.token_hex", lambda _: "abcdef")
+    _poll_server(vk_api)
+    vk_api.http_client.request_json = AsyncMock(
+        side_effect=[_probe_batch(123, "2"), _probe_batch(2_000_000_042, "3")]
+    )
+
+    # When: the operator requests the conversation ID.
+    await run("chat", [], 1)
+
+    # Then: readiness precedes the group config line; no chat message or token leaks.
+    output = capsys.readouterr().out
+    assert output.index("Готово") < output.index("CHAT_PEER_ID=2000000042")
+    assert "VK ID автора проверочного сообщения: 123" in output
+    assert token not in output
+    assert vk_api.messages.mock_calls == []
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("failed", [1, 2, 3])
-async def test_ready_probe_returns_community_peer_and_does_not_send_messages(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    failed: int,
+async def test_long_poll_resumes_with_updated_cursor_or_refreshed_server(
+    vk_api: MagicMock, monkeypatch: pytest.MonkeyPatch, failed: int
 ) -> None:
-    # Given: community Long Poll is initialized before a new probe is sent.
+    # Given: a recovery response and a matching message after it.
     monkeypatch.setattr("src.vk_ids.secrets.token_hex", lambda _: "abcdef")
-    api = MagicMock(spec=API)
-    api.http_client = MagicMock()
-    api.groups.get_by_id = AsyncMock(
-        return_value=MagicMock(
-            groups=[
-                MagicMock(id=7, name="Волейбол"),
-            ]
-        )
+    _poll_server(vk_api)
+    initial = vk_api.groups.get_long_poll_server.return_value
+    refreshed = SimpleNamespace(
+        server="https://lp.vk.com/refreshed", key="refreshed-key", ts="20"
     )
-    api.groups.get_long_poll_server = AsyncMock(
-        return_value=MagicMock(
-            server="https://lp.vk.com/test",
-            key="secret",
-            ts="1",
-        )
+    vk_api.groups.get_long_poll_server.side_effect = [initial, refreshed]
+    vk_api.http_client.request_json = AsyncMock(
+        side_effect=[{"failed": failed, "ts": "2"}, _probe_batch(2_000_000_042, "21")]
     )
-    api.http_client.request_json = AsyncMock(
-        side_effect=[
-            {"failed": failed, "ts": "2"},
-            {
-                "ts": "3",
-                "updates": [
-                    {
-                        "type": "message_new",
-                        "object": {
-                            "message": {
-                                "peer_id": 123,
-                                "from_id": 123,
-                                "text": "vk-peer-abcdef",
-                            },
-                        },
-                    }
-                ],
-            },
-            {
-                "ts": "4",
-                "updates": [
-                    {
-                        "type": "message_new",
-                        "object": {
-                            "message": {
-                                "peer_id": 2_000_000_042,
-                                "from_id": 123,
-                                "text": "vk-peer-abcdef",
-                            },
-                        },
-                    }
-                ],
-            },
-        ]
-    )
-    # When: the probe is sent first in private, then in the intended chat.
-    result = await find_chat(api, wait_seconds=1)
-    # Then: the personal dialog is ignored and the community's group peer is used.
+
+    # When: polling recovers and reads the next batch.
+    result = await find_chat(vk_api, wait_seconds=1)
+
+    # Then: failure 1 advances ts; failures 2/3 refresh the server before continuing.
     assert result == ChatIds(peer_id=2_000_000_042, from_id=123)
-    assert "Готово" in capsys.readouterr().out
-    assert api.http_client.request_json.await_args.kwargs["params"]["ts"] == "3"
-    assert api.groups.get_long_poll_server.await_count == (1 if failed == 1 else 2)
-    assert api.messages.mock_calls == []
+    resumed = vk_api.http_client.request_json.await_args.kwargs
+    server = initial if failed == 1 else refreshed
+    assert resumed["url"] == server.server
+    assert resumed["params"]["key"] == server.key
+    assert resumed["params"]["ts"] == ("2" if failed == 1 else "20")
+    assert vk_api.groups.get_long_poll_server.await_count == (1 if failed == 1 else 2)
 
 
 @pytest.mark.anyio
-async def test_chat_wait_is_bounded() -> None:
-    api = MagicMock(spec=API)
-    api.http_client = MagicMock()
+async def test_chat_wait_is_bounded(vk_api: MagicMock) -> None:
+    _poll_server(vk_api)
 
     async def wait_for_messages(**_kwargs: object) -> None:
         await anyio.sleep_forever()
 
-    api.http_client.request_json = AsyncMock(side_effect=wait_for_messages)
-    api.groups.get_by_id = AsyncMock(
-        return_value=MagicMock(
-            groups=[
-                MagicMock(id=7, name="Волейбол"),
-            ]
-        )
-    )
-    api.groups.get_long_poll_server = AsyncMock(return_value=MagicMock(ts="1"))
+    vk_api.http_client.request_json = AsyncMock(side_effect=wait_for_messages)
     with pytest.raises(TimeoutError):
-        await find_chat(api, wait_seconds=0)
+        await find_chat(vk_api, wait_seconds=0)
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("command", ["chat", "users"])
-async def test_lookup_prints_config_line_and_closes_connection(
+@pytest.mark.parametrize("failed", [False, True])
+async def test_cli_releases_http_session_after_lookup(
+    vk_api: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
     command: str,
+    failed: bool,
 ) -> None:
-    # Given: successful API lookups with a secret community token.
-    token = secrets.token_urlsafe()
-    monkeypatch.setenv("VK_TOKEN", token)
-    api = MagicMock(spec=API)
-    api.http_client = MagicMock()
-    api.http_client.close = AsyncMock()
-    monkeypatch.setattr("src.vk_ids.API", MagicMock(return_value=api))
-    monkeypatch.setattr(
-        "src.vk_ids.find_chat",
-        AsyncMock(
-            return_value=ChatIds(peer_id=2_000_000_042, from_id=123),
-        ),
+    # Given: lookup operations that either return or raise while owning an API session.
+    lookup = AsyncMock(
+        return_value=ChatIds(peer_id=2_000_000_042, from_id=123)
+        if command == "chat"
+        else [123]
     )
-    monkeypatch.setattr("src.vk_ids.resolve_users", AsyncMock(return_value=[123, 456]))
-    # When: the setup command runs.
-    await run(command, ["person"], 180)
-    # Then: a ready-to-copy config line is printed, without exposing the token.
-    output = capsys.readouterr().out
-    expected = (
-        "CHAT_PEER_ID=2000000042" if command == "chat" else "ADMIN_VK_IDS_RAW=123,456"
-    )
-    assert expected in output
-    assert token not in output
-    api.http_client.close.assert_awaited_once_with()
+    if failed:
+        lookup.side_effect = ValueError("lookup failed")
+    operation = "find_chat" if command == "chat" else "resolve_users"
+    monkeypatch.setattr(f"src.vk_ids.{operation}", lookup)
 
+    # When: the lookup finishes or unwinds after an error.
+    if failed:
+        with pytest.raises(ValueError, match="lookup failed"):
+            await run(command, ["person"], 1)
+    else:
+        await run(command, ["person"], 1)
 
-@pytest.mark.anyio
-async def test_failed_lookup_closes_connection_without_admin_line(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("VK_TOKEN", secrets.token_urlsafe())
-    api = MagicMock(spec=API)
-    api.http_client = MagicMock()
-    api.http_client.close = AsyncMock()
-    monkeypatch.setattr("src.vk_ids.API", MagicMock(return_value=api))
-    monkeypatch.setattr(
-        "src.vk_ids.resolve_users",
-        AsyncMock(
-            side_effect=ValueError("Не найден пользователь"),
-        ),
-    )
-    with pytest.raises(ValueError, match="Не найден пользователь"):
-        await run("users", ["missing"], 180)
-    assert "ADMIN_VK_IDS_RAW=" not in capsys.readouterr().out
-    api.http_client.close.assert_awaited_once_with()
+    # Then: the HTTP session is always closed once.
+    vk_api.http_client.close.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize(
