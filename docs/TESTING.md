@@ -51,8 +51,8 @@ uv run --frozen pytest --cov=src --cov-report=term-missing
 Клавиатура проверяется по смыслу доступных действий и inline-режиму, без
 фиксирования цветов, эмодзи и раскладки. Технические тесты отдельно защищают
 атомарную запись, перезапуск, протокол Long Poll и закрытие HTTP-сессии.
-Результаты ревью и контрольных подмен описаны в
-[FOCUSED_SPECS_REVIEW.md](FOCUSED_SPECS_REVIEW.md).
+Порядок разработки, ревью и ведения знаний описан в
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 `test_manual_event_wakes_sleeping_scheduler_and_closes_actual_card_on_time`
 в `tests/test_scheduler.py` воспроизводит создание ручного события во время

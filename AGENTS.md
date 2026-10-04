@@ -1,124 +1,122 @@
 # PROJECT KNOWLEDGE BASE — VK Volleyball Bot
 
-**Stack:** Python 3.12, uv, vkbottle 4.x, anyio, pydantic/pydantic-settings
-**Layout:** src-package (imports as `from src.x import y`)
-**Entry:** `src/main.py` via `anyio.run(main)`
-**CI:** GitHub Actions on `main` — ruff check + format, basedpyright, pytest with coverage ≥80%, pip-audit
+**Stack:** Python 3.12, uv, vkbottle 4.x, anyio, pydantic/pydantic-settings.
+**Package:** imports use `from src.x import y`; entry is `src/main.py` via
+`anyio.run(main)`. CI on `main`: Ruff, basedpyright, pytest with branch coverage
+≥80%, pip-audit.
 
-## STRUCTURE
-```
-.
-├── src/          # 9 .py modules
-│   ├── main.py       # orchestration root: Config → Storage → Bot → TaskGroup
-│   ├── bot.py        # vkbottle handlers: 9 text + 4 callback, peer guard, admin cmds
-│   ├── scheduler.py  # weekly collect/remind loop with retry
-│   ├── storage.py    # JSON-backed mutable accumulator over frozen Pydantic entries
-│   ├── config.py     # pydantic-settings from .env, fully validated
-│   ├── formatting.py # format_entries / help_text (extracted from bot.py)
-│   ├── keyboard.py   # shared inline keyboard builder
-│   └── __init__.py   # package marker
-├── tests/        # 94 pytest tests: 6 test files + conftest.py
-├── docs/         # 8 .md files — user-facing docs (not code docs)
-├── .github/workflows/ci.yml
-├── pyproject.toml
-├── uv.lock
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-└── README.md
-```
+## DEVELOPMENT RULES — READ FIRST
+
+- Before development, read [Piecemeal Growth](docs/mode-piecemeal-growth.md) and
+  [Focused Specs](docs/focused-specs.md). Apply both throughout implementation
+  and review, using [the project workflow](docs/DEVELOPMENT.md).
+- Start from the current user request, executable requirement or observed
+  failure. Make the smallest change that meets that need; introduce generality
+  only when present use requires it. Preserve integrity at real boundaries.
+- The application must satisfy the current BDD. Business specs have one request
+  and one user-visible or durable `Then`, through the product boundary. For bot
+  behavior use the actual router, keyboard payload, storage and card publisher;
+  mock the external VK API. Keep infrastructure contracts separate.
+- Work in a separate `codex/` branch. Inspect Git state and preserve unrelated
+  work; reuse the task's existing branch when appropriate.
+- `docs/` is current knowledge. The complete catalog below is always in agent
+  context; read the documents relevant to the task, rather than loading all files.
+  Keep this catalog and `docs/README.md` current when docs are added/moved/removed.
+- `records/` is dated history, outside routine startup and repository searches.
+  Exclude `records/**` from project-wide discovery with `rg -g '!records/**'`.
+  Read/search a specific record only for a user request or a concrete need for
+  historical evidence in the current task; state that need first. Old plans do
+  not create current tasks. Do not update historical code names, commands or
+  results after a refactor; record new findings separately.
+- Temporary inline memory is allowed now, using only standalone comments
+  `# AGENT-NOTE: <observed surprise or local constraint>; <reason/evidence>`.
+  Do not tag obvious code, future plans or rules already in docs. Find all notes
+  with `rg -n '^[ \t]*# AGENT-NOTE:' src tests scripts`. When knowledge stabilizes
+  or duplicates accumulate, validate, deduplicate, promote it to docs and remove
+  the notes. Bulk removal and the lifecycle are in `docs/DEVELOPMENT.md`.
+
+## CURRENT DOCUMENT CATALOG
+
+| Document | Read for |
+|---|---|
+| [docs/README.md](docs/README.md) | Navigation through current knowledge |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development workflow, docs/records boundary, inline memory |
+| [docs/mode-piecemeal-growth.md](docs/mode-piecemeal-growth.md) | Scope and design decisions; required before development |
+| [docs/focused-specs.md](docs/focused-specs.md) | Behavior specs and their review; required before development |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Data flow, event lifecycle, concurrency and persistence |
+| [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | Current module contracts and API |
+| [docs/BOT_COMMANDS.md](docs/BOT_COMMANDS.md) | User/admin commands, card behavior and registration rules |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Env settings, VK IDs, schedule validation and timezone |
+| [docs/TESTING.md](docs/TESTING.md) | Automated checks and manual acceptance procedures |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, systemd, VPS and general deployment |
+| [docs/PROXMOX_LXC.md](docs/PROXMOX_LXC.md) | Ubuntu LXC on Proxmox, systemd and backups |
+| [docs/CLOUDRU.md](docs/CLOUDRU.md) | cloud.ru VM deployment |
+| [docs/CLOUDRU_CONTAINERAPPS.md](docs/CLOUDRU_CONTAINERAPPS.md) | cloud.ru Container Apps deployment |
 
 ## WHERE TO LOOK
-| Task | Location | Notes |
-|------|----------|-------|
-| Add command | `src/bot.py` — append handler in `setup_handlers` | Text and callback handlers are paired manually; each carries a `# Duplicates cb_X — keep in sync` comment |
-| Change schedule | `src/config.py` + `src/scheduler.py` | Two event types: `collect_*` (clear + announce) and `remind_*` (send current list); collision of both is rejected by `_validate_schedule_collision` |
-| Change storage schema | `src/storage.py` — `UserEntry` / `FriendEntry` | Discriminated union via `kind`; add variant → update `match/case` in `src/formatting.py` (`format_entries`) |
-| Add/change inline keyboard | `src/keyboard.py` — builder + 4 `cb_*` handlers in `src/bot.py` | `PayloadRule({"cmd": "..."})` on `GroupEventType.MESSAGE_EVENT`; scheduler messages reuse the same keyboard |
-| Env vars / secrets | `.env` (gitignored) + `src/config.py` | `VK_TOKEN`, `CHAT_PEER_ID`, `COLLECT_WEEKDAY`, `COLLECT_TIME`, `REMIND_ENABLED`, `REMIND_WEEKDAY`, `REMIND_TIME`, `ADMIN_VK_IDS_RAW`, `DATA_PATH` |
-| Admin commands | `src/bot.py` admin section + `Config.is_admin` | `очистить`/`сбросить`, `убрать Имя`/`удалить Имя`, `админ помощь`; unauthorized attempts are logged and refused |
-| Docker deploy | `Dockerfile` + `docs/DEPLOYMENT.md` | Non-root user, healthcheck, resource limits; `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`; `TZ=Europe/Moscow` |
 
-## CODE MAP
-| Symbol | Type | File | Role |
-|--------|------|------|------|
-| `main` | async function | `src/main.py` | Entry point: initializes Config, Storage, Bot, launches TaskGroup |
-| `Config` | class | `src/config.py` | pydantic-settings; validates weekdays 0–6, `HH:MM` times, data_path traversal, admin IDs, collect/remind collision |
-| `Config.is_admin` | method | `src/config.py` | Checks `vk_id` against `admin_vk_ids` tuple |
-| `Storage` | class | `src/storage.py` | JSON persistence; mutable wrapper over frozen `Entry` list; limits: 100 entries, 100-char names |
-| `UserEntry` | pydantic model | `src/storage.py` | VK participant: `kind="user"`, `vk_id`, `name` |
-| `FriendEntry` | pydantic model | `src/storage.py` | Name-only participant: `kind="friend"`, `name` |
-| `Storage.remove_by_name` | async method | `src/storage.py` | Removes first entry (user or friend) matching name — backs the admin remove command |
-| `setup_handlers` | function | `src/bot.py` | Registers 9 text handlers + 4 callback handlers; wraps every one in `target_peer_only`; noqa:C901,PLR0915 |
-| `target_peer_only` | decorator (nested) | `src/bot.py` | Drops any message/event whose `peer_id != config.chat_peer_id` before any data read or mutation |
-| `_admin_help_text` | function | `src/bot.py` | Static admin help text |
-| `extract_friend_name` | function | `src/bot.py` | Trims name after `+` / `-` command sign |
-| `run_scheduler` | async function | `src/scheduler.py` | Infinite loop: sleeps until the nearer of collect/remind target, then clears+announces or sends reminder |
-| `_next_target` | function | `src/scheduler.py` | Pure helper: next configured weekday/time that has not elapsed |
-| `_pick_next_event` | function | `src/scheduler.py` | Chooses the earlier of collect vs remind target |
-| `_send_announcement` | async function | `src/scheduler.py` | Weekly collect message via VK API |
-| `_send_reminder` | async function | `src/scheduler.py` | Reminder message with current participant list |
-| `_run_with_retry` | async function | `src/scheduler.py` | Retry loop shared by both sends: 5-min sleep on `OSError`/`TimeoutError`/`VKAPIError`, re-raises cancellation |
-| `build_inline_keyboard` | function | `src/keyboard.py` | Shared inline keyboard JSON: ➕ join, ➖ leave, 📋 list, ❓ help |
-| `format_entries` | function | `src/formatting.py` | Numbered participant list with `(друг)` suffix; exhaustive `match` with `assert_never` |
-| `help_text` | function | `src/formatting.py` | Static help; `compact=True` variant for callback responses |
+| Task | Location and current contract |
+|---|---|
+| Entry/orchestration | `src/main.py`: Config → Storage → Bot → shared CardPublisher → TaskGroup |
+| Commands and permissions | `src/bot.py`: `setup_handlers`, peer guard, private admin replies; signup/withdrawal text and callback paths share helpers |
+| Cards and VK IDs | `src/cards.py`: one shared publisher, persisted `message_id` and `conversation_message_id`, serialized replacement/edit/delete |
+| Schedule and manual events | `src/config.py` + `src/scheduler.py`: collect/remind and saved event close deadline; `open_manual_event` shares the publisher |
+| Storage schema | `src/storage.py`: frozen `UserEntry`/`FriendEntry`, registration snapshot, atomic transitions and late withdrawal/restore |
+| Text and keyboard | `src/formatting.py` + `src/keyboard.py`: current event card, help, three inline callback actions |
+| Setup IDs without running bot | `src/vk_ids.py`: community Long Poll probe and profile lookup |
+| Behavior specs | `tests/test_bot_handlers.py`: real routed requests and durable outcomes; other test responsibilities are in `docs/TESTING.md` |
+| Runtime scripts | `scripts/`: platform-specific start/stop, PID, logs and process lock |
+| Deployment | `Dockerfile`, `docker-compose.yml`, `.env.example`, deployment docs |
 
-## CONVENTIONS
-- **Line length:** 88 (Ruff); `ruff format` is enforced in CI
-- **Type checking:** `basedpyright` in mode `all`; a small set of rules is intentionally downgraded to `warning` with the rationale documented in `pyproject.toml` comments (vkbottle nested handlers read as unused, `Config()` called without args, exhaustiveness sentinel)
-- **Lint:** Ruff `select = ["ALL"]` with explicit ignore list (see pyproject.toml)
-- **Tests:** pytest with `--strict-config --strict-markers`, `filterwarnings = ["error"]`; coverage `fail_under = 80`, `branch = true`
-- **Docstrings:** Google style
-- **Models:** Pydantic models are `frozen=True` by default; `Config` itself is **not** frozen (exception)
-- **Imports:** `from src.x import y` — the package is literally named `src`
-- **Naming:** `_` prefix for intentionally unused return values (`_ = await msg.answer(...)`); `reportUnusedCallResult` is a warning
-- **Storage:** All public methods are `async` and guarded by `asyncio.Lock`; `_save()` writes tempfile + `replace()` inside `asyncio.to_thread`; `_commit()` saves first and mutates in-memory state only on success, so a failed save leaves state untouched
-- **Scheduler:** Resilient to VK API/network failures — `_run_with_retry` loops with a 5-minute sleep
-- **Handler pairing:** Every mutating text command has a callback twin (`sign_up`↔`cb_join`, `sign_off`↔`cb_leave`, `show_list`↔`cb_list`); bodies are duplicated deliberately and marked "keep in sync"
+## CONVENTIONS AND CURRENT CONSTRAINTS
 
-## ANTI-PATTERNS (THIS PROJECT)
-- `eval` / `exec` / `globals()` — absent; project forbids dynamic execution
-- Unstructured dicts — absent; all data flows through Pydantic models
-- Mutable global state — absent; `Storage` is instance-local, passed explicitly
-- **Allowed with pragma:**
-  - `noqa:C901,PLR0915` on `setup_handlers` — routing table is intentionally dense
-  - `noqa:DTZ005` on `datetime.datetime.now()` — scheduler uses naive wall-clock time by design
-  - `noqa:PLR2004` in `Config._validate_time` — magic `2` for HH:MM part lengths
-  - `type:ignore[reportUnnecessaryComparison]` on the exhaustiveness sentinel in `formatting.py` — required for the `assert_never` guard
+- Ruff selects `ALL`, line length 88, Google docstrings. Explicit exceptions
+  live in `pyproject.toml`; `setup_handlers` may use `noqa:C901,PLR0915`.
+- Basedpyright uses `all` for `src/`. Intentional warnings for framework
+  registrations, settings constructors and the exhaustiveness sentinel have
+  their rationale in `pyproject.toml`.
+- Pytest uses strict config/markers and warnings as errors. Coverage is branch
+  coverage with a mandatory 80% floor. Preserve meaningful boundary cases.
+- Pydantic data models are frozen; `Config` is intentionally mutable. Use typed
+  models at data boundaries. Do not use `eval`, `exec`, `globals()` or mutable
+  global application state.
+- `_` names intentionally unused call results. Imports are literally `src.*`;
+  changing the package name also affects Docker's entry command.
+- `Storage` serializes mutations with `asyncio.Lock`; `_commit()` saves before
+  changing memory. `_save()` writes a tempfile and replaces the file in a thread.
+  A failed save leaves live and durable state intact. Limits are 100 entries and
+  100-character names. Locks assume one event loop.
+- `CardPublisher` must be shared by handlers and scheduler. Save the new card's
+  identity before deleting the old card. VK deletion refusals must be observed.
+- Registration lifecycle is `closed → opening → open → closed`; opening metadata
+  is persisted before sending. Retry uses the saved `random_id` and deadline.
+  Recovery closes legacy active state without a deadline, preserving attendance.
+- At event start new identities are refused. Existing rows may withdraw/restore
+  during the first 30 minutes; withdrawn rows remain marked `(-)` below active
+  rows and are excluded from the count. At exactly 30 minutes changes are refused.
+- Scheduler uses server local wall-clock time; Docker uses `Europe/Moscow`.
+  `datetime.now()` has the intentional `noqa:DTZ005`. Network/API failures retry
+  after five minutes; cancellation propagates. Bot and scheduler share an anyio
+  task group, so an uncaught failure stops both.
+- Every text/callback handler ignores other peers before data access. Admin
+  commands require positive user IDs from `ADMIN_VK_IDS_RAW`; an empty list
+  disables access for everyone. Commands are deleted before their action;
+  admin help, status and errors are private.
+- Participant text commands move the current card last; callbacks edit it in
+  place and use snackbar feedback. Buttons are signup, withdrawal and help.
 
 ## COMMANDS
-```bash
-# install
-uv sync
 
-# lint / format / type-check (mirrors CI)
+```bash
+uv sync
 uv run ruff check src tests
 uv run ruff format --check src tests
 uv run basedpyright
-
-# tests with mandatory 80% coverage gate
 uv run pytest --cov=src --cov-report=term-missing
-
-# dependency CVE audit (CI step)
 uv run pip-audit --desc
-
-# run locally
 uv run python -m src.main
-
-# docker
-docker build -t vk-volleyball-bot .
-docker run -d --env-file .env --restart unless-stopped vk-volleyball-bot
 ```
 
-## NOTES
-- **Concurrency:** `anyio.create_task_group()` runs `bot.run_polling()` + `run_scheduler()` together. If one crashes, both die.
-- **Storage thread safety:** `Storage` has `asyncio.Lock`. Safe within one event loop; unsafe if moved to multiprocess/threaded runtime.
-- **Atomic writes:** `Storage._save()` writes to a tempfile then uses `replace()` for atomic update. A crash during write leaves the original file intact; a failed save raises `OSError` and in-memory state is not mutated.
-- **Storage limits:** 100 entries max, names capped at 100 chars; overflow raises `ValueError` which handlers surface as a chat reply.
-- **Timezone dependency:** Scheduler relies on server local time. Dockerfile hardcodes `Europe/Moscow`.
-- **Scheduler events:** Two recurring events — `collect` (clears the list, sends announcement) and `remind` (sends current list, no clear). `Config` rejects identical weekday+time for both when reminder is enabled.
-- **Peer restriction:** Every handler is wrapped in `target_peer_only`; events from any chat other than `CHAT_PEER_ID` are silently ignored before reading or mutating data.
-- **Admin rights:** `ADMIN_VK_IDS_RAW` is a comma-separated env var parsed into a tuple of positive ints (`NoDecode`, custom pre-validator). Admin commands refuse non-admins with a logged warning.
-- **CI:** `.github/workflows/ci.yml` on push/PR to `main`: ruff check, ruff format --check, basedpyright, pytest with coverage gate, pip-audit.
-- **Inline keyboard:** All bot responses include the inline keyboard; weekly announcement and reminder also include it. Callback events require `PayloadRule` handlers on `GroupEventType.MESSAGE_EVENT`.
-- **Package name quirk:** The src-layout package is literally called `src`, so imports read `from src.bot import ...`. If refactored to a real package name, every import and the `Dockerfile` CMD change.
+For documentation-only changes, verify local links, catalog coverage and
+`git diff --check`; do not add mirrored tests or run the bot to check Markdown.
+Never commit `.env`, tokens, runtime JSON or logs.
