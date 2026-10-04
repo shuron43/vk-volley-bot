@@ -202,7 +202,7 @@ async def test_participant_signs_up_by_text(chat: Chat, command: str) -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("command", _spellings("отписаться", "-"))
+@pytest.mark.parametrize("command", _spellings("отписаться"))
 async def test_registered_participant_leaves_by_text(chat: Chat, command: str) -> None:
     # Given: the participant is listed one second before the event starts.
     await chat.open_event()
@@ -216,6 +216,23 @@ async def test_registered_participant_leaves_by_text(chat: Chat, command: str) -
     card = chat.updated_card("text")
     assert "Bob" in card
     assert "Alice" not in card
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", _spellings("-"))
+async def test_registered_participant_sends_bare_minus(
+    chat: Chat, command: str
+) -> None:
+    # Given: the participant and a friend are listed in the current event.
+    await chat.open_event()
+    await chat.storage.add_user(123, "Alice")
+    await chat.storage.add_friend("Bob")
+    before = await chat.saved()
+    # When: the participant sends a minus without a friend's name.
+    await chat.message(command)
+    # Then: the message is ignored, leaving attendance and the card unchanged.
+    assert await chat.saved() == before
+    assert chat.api.mock_calls == []
 
 
 @pytest.mark.anyio
@@ -258,8 +275,13 @@ async def test_participant_presses_help(chat: Chat) -> None:
     before = await chat.saved()
     # When: the participant presses help from the actual keyboard.
     await chat.press("Помощь")
-    # Then: snackbar guidance is shown without changing or republishing the card.
-    assert "список" in chat.feedback("button")
+    # Then: snackbar explains all signup/withdrawal commands without changing the card.
+    text = chat.feedback("button")
+    assert "Запись: записаться" in text
+    assert "Отписка: отписаться" in text.splitlines()
+    assert "+ Имя — записать друга" in text
+    assert "- Имя — отписать друга" in text
+    assert len(text) <= 90
     assert await chat.saved() == before
     chat.api.messages.send.assert_not_awaited()
     chat.api.messages.edit.assert_not_awaited()
@@ -352,7 +374,10 @@ async def test_participant_requests_text_help(chat: Chat, command: str) -> None:
     chat.api.messages.send.assert_awaited_once()
     text = chat.updated_card("text")
     assert "записаться" in text
+    assert "отписаться" in text
     assert "+ Имя" in text
+    assert "- Имя" in text
+    assert "не добавит вас" in text
     assert (await chat.saved()).participants == before
 
 

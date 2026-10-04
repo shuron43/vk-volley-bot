@@ -174,7 +174,7 @@ def setup_handlers(  # noqa: C901,PLR0915
         _ = msg
         await publish_text_result(bare_plus_message, changed=False)
 
-    @bot.on.message(RegexRule(re.compile(r"^\s*(?:-|отписаться)\s*$", re.IGNORECASE)))
+    @bot.on.message(RegexRule(re.compile(r"^\s*отписаться\s*$", re.IGNORECASE)))
     @target_peer_only
     async def sign_off(msg: Message) -> None:
         # Shares leave_user with cb_leave.
@@ -249,9 +249,13 @@ def setup_handlers(  # noqa: C901,PLR0915
     )
     @target_peer_only
     async def cb_help(event: MessageEvent) -> None:
-        _ = await event.show_snackbar(
-            "список — показать актуальную карточку в конце чата. Справка: помощь."
+        help_message = (
+            "Запись: записаться\n"
+            "Отписка: отписаться\n"
+            "+ Имя — записать друга\n"
+            "- Имя — отписать друга"
         )
+        _ = await event.show_snackbar(help_message)
 
     # --- Admin handlers ---
 
