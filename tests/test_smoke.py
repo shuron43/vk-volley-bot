@@ -55,5 +55,5 @@ async def test_main_starts_bot_and_scheduler(monkeypatch: pytest.MonkeyPatch) ->
     bot_factory.assert_called_once_with(config.vk_token)
     card_publisher_factory.assert_called_once_with(api, config, storage)
     setup_handlers.assert_called_once_with(bot, storage, config, cards)
-    run_scheduler.assert_awaited_once_with(api, config, storage, cards)
+    run_scheduler.assert_awaited_once_with(config, storage, cards)
     bot.run_polling.assert_awaited_once_with()

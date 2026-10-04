@@ -35,6 +35,13 @@ def _publisher() -> MagicMock:
     return publisher
 
 
+async def _open_event(storage: Storage, message_id: int | None) -> None:
+    """Prepare a current event through the production lifecycle."""
+    starts_at = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "weekly")
+    await storage.activate_event(message_id, starts_at)
+
+
 def _build_bot(storage: Storage, config: Config) -> tuple[Bot, MagicMock]:
     bot = Bot(config.vk_token)
     api = MagicMock()
@@ -90,7 +97,7 @@ async def test_text_signup_updates_storage_and_moves_card_last(
 ) -> None:
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(None)
+    await _open_event(storage, None)
     bot, publisher = _build_bot(storage, config)
     message = _message(config, text="записаться")
 
@@ -239,12 +246,12 @@ async def test_signup_rejects_collection_changed_during_vk_lookup(
 ) -> None:
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(1)
+    await _open_event(storage, 1)
     bot, publisher = _build_bot(storage, config)
 
     async def change_collection(**_kwargs: object) -> list[SimpleNamespace]:
-        await storage.mark_opening()
-        await storage.start_new_collection(2)
+        await storage.close_registration()
+        await _open_event(storage, 2)
         return [SimpleNamespace(first_name="Alice")]
 
     bot.api.users.get = AsyncMock(side_effect=change_collection)
@@ -261,7 +268,7 @@ async def test_friend_commands_and_views_keep_one_card(
 ) -> None:
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(None)
+    await _open_event(storage, None)
     bot, publisher = _build_bot(storage, config)
     handlers = _message_handlers(bot)
 
@@ -281,7 +288,7 @@ async def test_callback_updates_card_and_uses_snackbar(
 ) -> None:
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(None)
+    await _open_event(storage, None)
     bot, publisher = _build_bot(storage, config)
     handlers = _callback_handlers(bot)
     event = _event(config)
@@ -302,7 +309,7 @@ async def test_three_callbacks_keep_card_in_place_and_help_in_snackbar(
     # Given: a card with three inline actions and open registration.
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(None)
+    await _open_event(storage, None)
     bot, publisher = _build_bot(storage, config)
     handlers = _callback_handlers(bot)
     assert set(handlers) == {"cb_join", "cb_leave", "cb_help"}
@@ -336,7 +343,7 @@ async def test_list_command_republishes_card_with_current_participants(
     # Given: an existing card with a participant, buried in the chat history.
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(10)
+    await _open_event(storage, 10)
     await storage.add_friend("Друг")
     before = await storage.list_entries()
     bot = Bot(config.vk_token)
@@ -345,7 +352,7 @@ async def test_list_command_republishes_card_with_current_participants(
     api.messages.delete = AsyncMock()
     api.messages.edit = AsyncMock()
     bot.api = api
-    setup_handlers(bot, storage, config)
+    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
     message = _message(config, text=command)
 
     # When: the participant requests the list using a supported text alias.
@@ -376,7 +383,7 @@ async def test_duplicate_callback_does_not_edit_unchanged_card(
 ) -> None:
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(None)
+    await _open_event(storage, None)
     bot, publisher = _build_bot(storage, config)
     handler = _callback_handlers(bot)["cb_join"]
     event = _event(config)
@@ -409,7 +416,6 @@ async def test_admin_creates_manual_event_with_shared_publisher(
         await _message_handlers(bot)["admin_create_event"](message)
 
     open_event.assert_awaited_once_with(
-        bot.api,
         config,
         storage,
         datetime.datetime(2099, 9, 22, 19, 30),  # noqa: DTZ001
@@ -445,7 +451,7 @@ async def test_user_commands_accept_case_and_outer_spaces_through_router(
     # Given: an open collection and a VK participant sending a documented command.
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(10)
+    await _open_event(storage, 10)
     if action == "leave":
         await storage.add_user(123, "Alice")
     bot, publisher = _build_bot(storage, config)
@@ -478,7 +484,7 @@ async def test_friend_commands_trim_edges_without_changing_name_case(
 ) -> None:
     config = Config(vk_token=secrets.token_urlsafe(), chat_peer_id=2_000_000_001)
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(10)
+    await _open_event(storage, 10)
     bot, publisher = _build_bot(storage, config)
     await _route_admin_message(bot, config, "  + АнНа ПЕТРОВА  ")
     assert [entry.name for entry in await storage.list_entries()] == ["АнНа ПЕТРОВА"]
@@ -800,7 +806,7 @@ async def test_delete_event_through_router_removes_command_before_event(
 
     api.messages.delete = AsyncMock(side_effect=delete)
     bot.api = api
-    setup_handlers(bot, storage, config)
+    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
 
     # When: the command arrives through Long Poll with case and outer spaces.
     await _route_admin_message(bot, config, "  УДАЛИТЬ СОБЫТИЕ  ")

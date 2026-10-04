@@ -272,7 +272,9 @@ async def test_failed_cancellation_save_preserves_event_and_card(
     tmp_path: Path,
 ) -> None:
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(12)
+    starts_at = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "manual")
+    await storage.activate_event(12, starts_at)
     await storage.add_friend("Друг")
     before = await storage.snapshot()
     api = _api(_response())
@@ -290,7 +292,9 @@ async def test_failed_cancellation_save_preserves_event_and_card(
 @pytest.mark.anyio
 async def test_vk_delete_failure_reports_cancelled_event(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(12)
+    starts_at = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "manual")
+    await storage.activate_event(12, starts_at)
     api = _api(_response())
     api.messages.delete.side_effect = OSError("VK unavailable")
     publisher = CardPublisher(api, _config(), storage)
@@ -310,7 +314,9 @@ async def test_vk_individual_delete_refusal_preserves_card_for_retry(
 ) -> None:
     # Given: VK returns success at transport level but refuses this message.
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(12)
+    starts_at = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
+    assert await storage.begin_event(starts_at, "manual")
+    await storage.activate_event(12, starts_at)
     api = _api(_response())
     api.messages.delete.return_value = [
         MessagesDeleteFullResponseItem(message_id=12, response=False)

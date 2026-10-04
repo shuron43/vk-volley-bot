@@ -4,9 +4,8 @@ import datetime
 from collections.abc import Sequence
 from typing import Final, assert_never
 
-from src.storage import Entry, FriendEntry, UserEntry
+from src.storage import Entry, FriendEntry, RegistrationState, UserEntry
 
-_MAX_NAME_LENGTH: Final = 100
 _HELP_TEXT: Final = (
     "Запись открывается после анонса и закрывается в момент начала события.\n"
     "Для себя — «записаться» или кнопка «✅ Записаться».\n"
@@ -63,22 +62,14 @@ def format_entries(entries: Sequence[Entry]) -> str:
     return "Список участников:\n" + "\n".join(lines)
 
 
-def help_text(*, compact: bool = False) -> str:
-    """Return lifecycle-aware help for text and callback messages."""
-    _ = compact
+def help_text() -> str:
+    """Return lifecycle-aware help for text messages."""
     return _HELP_TEXT
-
-
-def format_event_start(value: datetime.datetime) -> str:
-    """Format a local event start for chat messages."""
-    weekday = _WEEKDAYS[value.weekday()].capitalize()
-    month = _MONTHS_GENITIVE[value.month - 1]
-    return f"{weekday}, {value.day} {month} {value.year} в {value:%H:%M}"
 
 
 def format_registration_card(
     entries: Sequence[Entry],
-    state: str,
+    state: RegistrationState,
     event_starts_at: datetime.datetime | None,
     *,
     notice: str | None = None,
@@ -89,7 +80,7 @@ def format_registration_card(
         "opening": "открываем запись",
         "closed": "запись закрыта",
     }
-    lines = [f"🏐 Волейбол — {labels.get(state, 'запись закрыта')}"]
+    lines = [f"🏐 Волейбол — {labels[state]}"]
     if event_starts_at is not None:
         weekday = _WEEKDAYS[event_starts_at.weekday()].capitalize()
         month = _MONTHS_GENITIVE[event_starts_at.month - 1]

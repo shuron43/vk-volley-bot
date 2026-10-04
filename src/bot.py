@@ -60,10 +60,10 @@ def setup_handlers(  # noqa: C901,PLR0915
     bot: Bot,
     storage: Storage,
     config: Config,
-    cards: CardPublisher | None = None,
+    cards: CardPublisher,
 ) -> None:
     """Register message handlers on the bot instance."""
-    publisher = cards or CardPublisher(bot.api, config, storage)
+    publisher = cards
     registration_closed_message = (
         "Запись закрыта. Дождись следующего анонса или нажми «Помощь»."
     )
@@ -309,7 +309,6 @@ def setup_handlers(  # noqa: C901,PLR0915
         try:
             event_starts_at = parse_event_start(msg.text or "")
             await open_manual_event(
-                bot.api,
                 config,
                 storage,
                 event_starts_at,

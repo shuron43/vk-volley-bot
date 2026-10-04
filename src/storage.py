@@ -178,17 +178,6 @@ class Storage:
             await self._commit_entries(entries)
             return True
 
-    async def remove_user(self, vk_id: int) -> bool:
-        """Remove a VK user. Returns True if removed."""
-        async with self._lock:
-            for i, e in enumerate(self._entries):
-                if e.kind == "user" and e.vk_id == vk_id:
-                    entries = self._entries.copy()
-                    _ = entries.pop(i)
-                    await self._commit_entries(entries)
-                    return True
-            return False
-
     def _now(self) -> datetime.datetime:
         """Read local time with the persisted event's timezone awareness."""
         tz = self._event_starts_at.tzinfo if self._event_starts_at else None
@@ -279,17 +268,6 @@ class Storage:
             entries = [*self._entries, FriendEntry(kind="friend", name=name)]
             await self._commit_entries(entries)
 
-    async def remove_friend(self, name: str) -> bool:
-        """Remove a friend by exact name. Returns True if removed."""
-        async with self._lock:
-            for i, e in enumerate(self._entries):
-                if e.kind == "friend" and e.name == name:
-                    entries = self._entries.copy()
-                    _ = entries.pop(i)
-                    await self._commit_entries(entries)
-                    return True
-            return False
-
     async def list_entries(self) -> list[Entry]:
         """Return a shallow copy of current entries."""
         async with self._lock:
@@ -299,16 +277,6 @@ class Storage:
         """Return the current registration lifecycle state."""
         async with self._lock:
             return self._registration_state
-
-    async def status_message_id(self) -> int | None:
-        """Return the current registration status message identifier."""
-        async with self._lock:
-            return self._status_message_id
-
-    async def status_conversation_message_id(self) -> int | None:
-        """Return the canonical card identifier inside the conversation."""
-        async with self._lock:
-            return self._status_conversation_message_id
 
     async def snapshot(self) -> RegistrationSnapshot:
         """Return one lock-consistent snapshot for rendering and diagnostics."""
@@ -321,29 +289,6 @@ class Storage:
                 collection_id=self._collection_id,
                 event_starts_at=self._event_starts_at,
                 event_source=self._event_source,
-            )
-
-    async def mark_opening(
-        self,
-        event_starts_at: datetime.datetime | None = None,
-        event_source: EventSource | None = None,
-    ) -> None:
-        """Persist that a new collection is being prepared."""
-        async with self._lock:
-            await self._commit(
-                _StorageData(
-                    participants=tuple(self._entries),
-                    registration_state="opening",
-                    status_message_id=self._status_message_id,
-                    status_conversation_message_id=self._status_conversation_message_id,
-                    collection_id=self._collection_id,
-                    announcement_random_id=(
-                        self._announcement_random_id
-                        or secrets.randbelow(2_147_483_646) + 1
-                    ),
-                    event_starts_at=event_starts_at or self._event_starts_at,
-                    event_source=event_source or self._event_source,
-                )
             )
 
     async def begin_event(
@@ -368,21 +313,6 @@ class Storage:
                 )
             )
             return True
-
-    async def start_new_collection(self, status_message_id: int | None) -> None:
-        """Atomically clear participants and open a new collection."""
-        async with self._lock:
-            await self._commit(
-                _StorageData(
-                    participants=(),
-                    registration_state="open",
-                    status_message_id=status_message_id,
-                    status_conversation_message_id=None,
-                    collection_id=self._collection_id + 1,
-                    event_starts_at=self._event_starts_at,
-                    event_source=self._event_source,
-                )
-            )
 
     async def activate_event(
         self,
@@ -500,11 +430,6 @@ class Storage:
                     event_source=self._event_source,
                 )
             )
-
-    async def is_registration_open(self) -> bool:
-        """Return whether the current collection accepts registrations."""
-        async with self._lock:
-            return self._registration_is_open(self._now())
 
     async def active_collection(self) -> int | None:
         """Return the open collection token for a guarded registration."""

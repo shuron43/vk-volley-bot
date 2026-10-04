@@ -158,7 +158,7 @@ async def test_finish_opening_activates_event_with_both_message_ids(
     assert await storage.begin_event(starts_at, "weekly")
     publisher = _publisher()
 
-    assert await scheduler._finish_opening(MagicMock(), config, storage, publisher)
+    assert await scheduler._finish_opening(storage, publisher)
 
     snapshot = await storage.snapshot()
     assert snapshot.state == "open"
@@ -183,7 +183,7 @@ async def test_finish_opening_closes_event_when_publication_reaches_deadline(
         SimpleNamespace(datetime=FrozenDateTime, timedelta=datetime.timedelta),
     )
 
-    assert not await scheduler._finish_opening(MagicMock(), config, storage, publisher)
+    assert not await scheduler._finish_opening(storage, publisher)
 
     assert await storage.registration_state() == "closed"
     publisher.publish_event.assert_not_awaited()
@@ -219,7 +219,7 @@ async def test_late_vk_response_cannot_reopen_event(
         SimpleNamespace(datetime=TickingDateTime, timedelta=datetime.timedelta),
     )
 
-    assert not await scheduler._finish_opening(MagicMock(), config, storage, publisher)
+    assert not await scheduler._finish_opening(storage, publisher)
 
     assert await storage.registration_state() == "closed"
     publisher.publish_event.assert_awaited_once()
@@ -237,7 +237,7 @@ async def test_manual_event_opens_immediately(
     publisher = _publisher()
 
     await scheduler.open_manual_event(
-        MagicMock(), config, storage, starts_at, cards=publisher, now=now
+        config, storage, starts_at, cards=publisher, now=now
     )
 
     assert await storage.registration_state() == "open"
@@ -256,7 +256,6 @@ async def test_manual_event_rejects_overlap_and_active_event(
 
     with pytest.raises(ValueError, match="пересекается"):
         await scheduler.open_manual_event(
-            MagicMock(),
             config,
             storage,
             datetime.datetime(2024, 1, 1, 10, 0, tzinfo=datetime.UTC),
@@ -267,7 +266,6 @@ async def test_manual_event_rejects_overlap_and_active_event(
     assert await storage.begin_event(now + datetime.timedelta(minutes=10), "manual")
     with pytest.raises(ValueError, match="активное событие"):
         await scheduler.open_manual_event(
-            MagicMock(),
             config,
             storage,
             now + datetime.timedelta(minutes=20),
@@ -277,14 +275,90 @@ async def test_manual_event_rejects_overlap_and_active_event(
 
 
 @pytest.mark.anyio
+async def test_scheduler_resumes_pending_card_with_saved_delivery_id(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Given: an interrupted announcement with the previous participant list.
+    path = tmp_path / "participants.json"
+    storage = Storage(path)
+    await storage.add_friend("Bob")
+    starts_at = datetime.datetime.now() + datetime.timedelta(days=1)  # noqa: DTZ005
+    assert await storage.begin_event(starts_at, "weekly")
+    random_id = await storage.announcement_random_id()
+    api = MagicMock()
+
+    async def send(**kwargs: object) -> int:
+        assert kwargs["random_id"] == random_id
+        assert (await storage.snapshot()).state == "opening"
+        assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
+        return 123
+
+    api.messages.send = AsyncMock(side_effect=send)
+    storage = Storage(path)
+    publisher = CardPublisher(api, config, storage)
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_for_schedule_change",
+        AsyncMock(side_effect=StopSchedulerError),
+    )
+
+    # When: the scheduler starts with the reloaded pending event.
+    with pytest.raises(StopSchedulerError):
+        await scheduler.run_scheduler(config, storage, publisher)
+
+    # Then: the saved delivery is activated and only now clears the old list.
+    api.messages.send.assert_awaited_once()
+    snapshot = await Storage(path).snapshot()
+    assert snapshot.state == "open"
+    assert snapshot.event_starts_at == starts_at
+    assert snapshot.status_message_id == 123
+    assert snapshot.participants == ()
+
+
+@pytest.mark.anyio
+async def test_pending_event_without_delivery_id_fails_without_republishing(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    # Given: an incomplete pending event cannot identify its original delivery.
+    path = tmp_path / "participants.json"
+    starts_at = datetime.datetime.now() + datetime.timedelta(days=1)  # noqa: DTZ005
+    path.write_text(
+        '{"participants": [{"kind": "friend", "name": "Bob"}], '
+        '"registration_state": "opening", '
+        f'"event_starts_at": "{starts_at.isoformat()}"}}',
+        encoding="utf-8",
+    )
+    original = path.read_bytes()
+    storage = Storage(path)
+    publisher = _publisher()
+
+    # When: startup tries to resume the incomplete announcement.
+    with pytest.raises(RuntimeError, match="announcement_random_id"):
+        await scheduler.run_scheduler(config, storage, publisher)
+
+    # Then: the violation is visible and no guessed delivery changes saved data.
+    publisher.publish_event.assert_not_awaited()
+    assert path.read_bytes() == original
+    assert await storage.registration_state() == "opening"
+    assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
+
+
+@pytest.mark.anyio
 async def test_scheduler_recovers_legacy_open_state_without_deadline(
     config: Config,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(None)
-    await storage.add_friend("Bob")
+    path = tmp_path / "participants.json"
+    path.write_text(
+        '{"participants": [{"kind": "friend", "name": "Bob"}], '
+        '"registration_state": "open"}',
+        encoding="utf-8",
+    )
+    storage = Storage(path)
     publisher = _publisher()
     monkeypatch.setattr(
         scheduler,
@@ -293,7 +367,7 @@ async def test_scheduler_recovers_legacy_open_state_without_deadline(
     )
 
     with pytest.raises(StopSchedulerError):
-        await scheduler.run_scheduler(MagicMock(), config, storage, publisher)
+        await scheduler.run_scheduler(config, storage, publisher)
 
     assert await storage.registration_state() == "closed"
     assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
@@ -326,7 +400,7 @@ async def test_scheduler_closes_elapsed_event_and_preserves_participants(
     )
 
     with pytest.raises(StopSchedulerError):
-        await scheduler.run_scheduler(MagicMock(), config, storage, publisher)
+        await scheduler.run_scheduler(config, storage, publisher)
 
     assert await storage.registration_state() == "closed"
     assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
@@ -351,7 +425,7 @@ async def test_scheduler_opens_weekly_event_after_announcement_time(
     monkeypatch.setattr(scheduler, "_wait_for_schedule_change", sleep)
 
     with pytest.raises(StopSchedulerError):
-        await scheduler.run_scheduler(MagicMock(), config, storage, publisher)
+        await scheduler.run_scheduler(config, storage, publisher)
 
     assert await storage.registration_state() == "open"
     assert await storage.list_entries() == []
@@ -400,7 +474,6 @@ async def test_manual_event_wakes_sleeping_scheduler_and_closes_actual_card_on_t
         if len(waits) == 1:
             # When: the admin creates a manual event while the scheduler sleeps.
             await scheduler.open_manual_event(
-                api,
                 config,
                 storage,
                 starts_at,
@@ -419,7 +492,7 @@ async def test_manual_event_wakes_sleeping_scheduler_and_closes_actual_card_on_t
 
     monkeypatch.setattr(scheduler, "_wait_for_schedule_change", wait)
     with pytest.raises(StopSchedulerError):
-        await scheduler.run_scheduler(api, config, storage, publisher)
+        await scheduler.run_scheduler(config, storage, publisher)
 
     # Then: the new deadline replaces the weekly wait, and the card closes in place.
     assert waits[:2] == [3600, 60]

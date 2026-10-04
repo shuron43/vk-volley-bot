@@ -16,12 +16,14 @@ if TYPE_CHECKING:
 
 type _Mutation = Literal[
     "add_user",
-    "remove_user",
+    "withdraw_user",
     "add_friend",
-    "remove_friend",
+    "withdraw_friend",
     "remove_by_name",
     "clear",
 ]
+
+_STARTS_AT = datetime.datetime(2099, 9, 22, 19, 30)  # noqa: DTZ001
 
 
 @pytest.mark.anyio
@@ -56,7 +58,7 @@ async def test_storage_loads_legacy_participants_as_closed(tmp_path: Path) -> No
 
     # Then
     assert await storage.registration_state() == "closed"
-    assert await storage.status_message_id() is None
+    assert (await storage.snapshot()).status_message_id is None
     assert [entry.name for entry in await storage.list_entries()] == ["Alice"]
 
 
@@ -79,7 +81,7 @@ async def test_storage_preserves_opening_for_recovery(tmp_path: Path) -> None:
 
     # Then
     assert await storage.registration_state() == "opening"
-    assert await storage.is_registration_open() is False
+    assert await storage.active_collection() is None
     assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
 
 
@@ -89,12 +91,15 @@ async def test_guarded_registration_rejects_previous_collection(
     tmp_path: Path, finish_opening: bool
 ) -> None:
     storage = Storage(tmp_path / "participants.json")
-    await storage.start_new_collection(1)
+    assert await storage.begin_event(_STARTS_AT, "weekly")
+    await storage.activate_event(1, _STARTS_AT)
     collection = await storage.active_collection()
     assert collection is not None
-    await storage.mark_opening()
+    await storage.close_registration()
+    next_start = _STARTS_AT + datetime.timedelta(days=7)
+    assert await storage.begin_event(next_start, "weekly")
     if finish_opening:
-        await storage.start_new_collection(2)
+        await storage.activate_event(2, next_start)
     with pytest.raises(ValueError, match="сбор изменился"):
         await storage.add_user(1, "Alice", expected_collection=collection)
     with pytest.raises(ValueError, match="сбор изменился"):
@@ -108,38 +113,36 @@ async def test_opening_identifier_survives_restart_and_mutations(
 ) -> None:
     path = tmp_path / "participants.json"
     storage = Storage(path)
-    await storage.start_new_collection(1)
-    collection = await storage.active_collection()
-    await storage.mark_opening()
+    collection = (await storage.snapshot()).collection_id
+    assert await storage.begin_event(_STARTS_AT, "weekly")
     random_id = await storage.announcement_random_id()
     assert random_id is not None
     await storage.clear()
     await storage.set_status_message_id(2)
     restored = Storage(path)
-    await restored.mark_opening()
     assert await restored.announcement_random_id() == random_id
-    await restored.start_new_collection(3)
+    await restored.activate_event(3, _STARTS_AT)
     assert await restored.active_collection() != collection
     assert await restored.announcement_random_id() is None
 
 
 @pytest.mark.anyio
-async def test_storage_starts_new_collection_as_open(tmp_path: Path) -> None:
+async def test_storage_activates_pending_event_as_open(tmp_path: Path) -> None:
     """Given prior entries, starting a collection atomically clears and opens it."""
     # Given
     path = tmp_path / "participants.json"
     storage = Storage(path)
     await storage.add_friend("Bob")
-    await storage.mark_opening()
+    assert await storage.begin_event(_STARTS_AT, "weekly")
 
     # When
-    await storage.start_new_collection(123)
+    await storage.activate_event(123, _STARTS_AT)
 
     # Then
     assert await storage.list_entries() == []
     assert await storage.registration_state() == "open"
-    assert await storage.is_registration_open() is True
-    assert await storage.status_message_id() == 123
+    assert await storage.active_collection() is not None
+    assert (await storage.snapshot()).status_message_id == 123
 
 
 @pytest.mark.anyio
@@ -150,7 +153,7 @@ async def test_event_lifecycle_persists_start_and_closes_without_clearing(
     storage = Storage(path)
     starts_at = datetime.datetime(2026, 9, 22, 19, 30)  # noqa: DTZ001
     assert await storage.begin_event(starts_at, "weekly") is True
-    await storage.start_new_collection(123)
+    await storage.activate_event(123, starts_at)
     await storage.add_friend("Bob")
 
     assert await storage.close_registration() is True
@@ -169,7 +172,7 @@ async def test_begin_event_rejects_overlapping_registration(tmp_path: Path) -> N
     second = datetime.datetime(2026, 9, 23, 20, 0)  # noqa: DTZ001
     assert await storage.begin_event(first, "manual") is True
     assert await storage.begin_event(second, "weekly") is False
-    await storage.start_new_collection(1)
+    await storage.activate_event(1, first)
     assert await storage.begin_event(second, "weekly") is False
     assert await storage.event_details() == (first, "manual")
 
@@ -196,7 +199,7 @@ async def test_storage_persists_status_message_id(tmp_path: Path) -> None:
     await storage.set_status_message_id(456)
 
     # Then
-    assert await Storage(path).status_message_id() == 456
+    assert (await Storage(path).snapshot()).status_message_id == 456
 
 
 @pytest.mark.anyio
@@ -223,9 +226,12 @@ async def test_missing_deadline_recovery_closes_without_clearing(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "participants.json"
+    path.write_text(
+        '{"participants": [{"kind": "friend", "name": "Bob"}], '
+        '"registration_state": "open", "status_message_id": 123}',
+        encoding="utf-8",
+    )
     storage = Storage(path)
-    await storage.start_new_collection(123)
-    await storage.add_friend("Bob")
 
     assert await storage.close_missing_deadline() is True
 
@@ -236,7 +242,7 @@ async def test_missing_deadline_recovery_closes_without_clearing(
 
 
 @pytest.mark.anyio
-async def test_storage_preserves_lifecycle_when_start_collection_save_fails(
+async def test_storage_preserves_lifecycle_when_activation_save_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,6 +251,7 @@ async def test_storage_preserves_lifecycle_when_start_collection_save_fails(
     path = tmp_path / "participants.json"
     storage = Storage(path)
     await storage.add_friend("Bob")
+    assert await storage.begin_event(_STARTS_AT, "weekly")
     original = path.read_text(encoding="utf-8")
 
     def fail_replace(self: Path, _target: Path) -> Path:
@@ -255,15 +262,15 @@ async def test_storage_preserves_lifecycle_when_start_collection_save_fails(
 
     # When / Then
     with pytest.raises(OSError, match="cannot replace"):
-        await storage.start_new_collection(123)
+        await storage.activate_event(123, _STARTS_AT)
 
     assert [entry.name for entry in await storage.list_entries()] == ["Bob"]
-    assert await storage.registration_state() == "closed"
-    assert await storage.status_message_id() is None
+    assert await storage.registration_state() == "opening"
+    assert (await storage.snapshot()).status_message_id is None
     assert path.read_text(encoding="utf-8") == original
     persisted = Storage(path)
     assert [entry.name for entry in await persisted.list_entries()] == ["Bob"]
-    assert await persisted.registration_state() == "closed"
+    assert await persisted.registration_state() == "opening"
 
 
 @pytest.mark.anyio
@@ -295,9 +302,9 @@ async def test_storage_preserves_original_when_atomic_replace_fails(
     "mutation",
     [
         "add_user",
-        "remove_user",
+        "withdraw_user",
         "add_friend",
-        "remove_friend",
+        "withdraw_friend",
         "remove_by_name",
         "clear",
     ],
@@ -312,6 +319,8 @@ async def test_storage_preserves_live_state_when_persistence_fails(
     # Given: two persisted entries and a failing atomic replacement
     path = tmp_path / "participants.json"
     storage = Storage(path)
+    assert await storage.begin_event(_STARTS_AT, "weekly")
+    await storage.activate_event(123, _STARTS_AT)
     assert await storage.add_user(1, "Alice") is True
     await storage.add_friend("Bob")
 
@@ -324,12 +333,12 @@ async def test_storage_preserves_live_state_when_persistence_fails(
     match mutation:
         case "add_user":
             operation = partial(storage.add_user, 2, "Carol")
-        case "remove_user":
-            operation = partial(storage.remove_user, 1)
+        case "withdraw_user":
+            operation = partial(storage.withdraw_user, 1)
         case "add_friend":
             operation = partial(storage.add_friend, "Carol")
-        case "remove_friend":
-            operation = partial(storage.remove_friend, "Bob")
+        case "withdraw_friend":
+            operation = partial(storage.withdraw_friend, "Bob")
         case "remove_by_name":
             operation = partial(storage.remove_by_name, "Alice")
         case "clear":

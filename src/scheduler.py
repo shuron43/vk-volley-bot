@@ -9,7 +9,6 @@ from typing import Final, Literal, NoReturn
 
 import anyio
 from vkbottle import VKAPIError
-from vkbottle.api import API
 
 from src.cards import CardPublisher, EventChangedError, MessageRef
 from src.config import Config
@@ -84,8 +83,6 @@ async def _run_with_retry[T](
             raise _EventExpiredError
         try:
             result = await operation()
-        except anyio.get_cancelled_exc_class():
-            raise
         except (OSError, TimeoutError, VKAPIError):
             _LOGGER.exception("%s failed; retrying in five minutes", label)
             delay = _RETRY_DELAY_SECONDS
@@ -106,20 +103,14 @@ def _now_for(reference: datetime.datetime) -> datetime.datetime:
 
 
 async def _finish_opening(
-    api: API,
-    config: Config,
     storage: Storage,
-    cards: CardPublisher | None = None,
+    cards: CardPublisher,
 ) -> bool:
     """Resume delivery and durable activation of an interrupted event."""
-    publisher = cards or CardPublisher(api, config, storage)
     event_starts_at, event_source = await storage.event_details()
     if event_starts_at is None:
-        event_starts_at = _weekly_event_after(datetime.datetime.now(), config)  # noqa: DTZ005
-        event_source = "weekly"
-        await storage.mark_opening(event_starts_at, event_source)
-    if await storage.announcement_random_id() is None:
-        await storage.mark_opening(event_starts_at, event_source or "weekly")
+        message = "Pending event has no event_starts_at"
+        raise RuntimeError(message)
     random_id = await storage.announcement_random_id()
     if random_id is None:
         message = "Pending event has no announcement_random_id"
@@ -149,11 +140,11 @@ async def _finish_opening(
     try:
         _ = await _run_with_retry(
             "Event card publication",
-            partial(publisher.publish_event, event_starts_at, random_id, activate),
+            partial(cards.publish_event, event_starts_at, random_id, activate),
             deadline=event_starts_at,
         )
     except _EventExpiredError:
-        await _close_event(storage, publisher)
+        await _close_event(storage, cards)
         return False
     except EventChangedError:
         _LOGGER.info("Event announcement cancelled before delivery")
@@ -183,13 +174,12 @@ async def _wait_for_schedule_change(changed: Event, delay: float) -> bool:
     return not scope.cancel_called
 
 
-async def open_manual_event(  # noqa: PLR0913
-    api: API,
+async def open_manual_event(
     config: Config,
     storage: Storage,
     event_starts_at: datetime.datetime,
     *,
-    cards: CardPublisher | None = None,
+    cards: CardPublisher,
     now: datetime.datetime | None = None,
 ) -> None:
     """Open an administrator-created event after overlap checks."""
@@ -227,19 +217,18 @@ async def open_manual_event(  # noqa: PLR0913
         "Manual event transition closed -> opening: start=%s",
         event_starts_at,
     )
-    if not await _finish_opening(api, config, storage, cards):
+    if not await _finish_opening(storage, cards):
         message = "Событие уже началось: запись осталась закрытой."
         raise ValueError(message)
 
 
 async def run_scheduler(
-    api: API,
     config: Config,
     storage: Storage,
-    cards: CardPublisher | None = None,
+    cards: CardPublisher,
 ) -> NoReturn:
     """Run weekly announcements, reminders, and automatic closures forever."""
-    publisher = cards or CardPublisher(api, config, storage)
+    publisher = cards
     _LOGGER.info(
         "Scheduler started: announcement=%d %s, event=%d %s",
         config.collect_weekday,
@@ -262,7 +251,7 @@ async def run_scheduler(
             await _close_event(storage, publisher)
         else:
             _LOGGER.info("Resuming interrupted event announcement")
-            _ = await _finish_opening(api, config, storage, publisher)
+            _ = await _finish_opening(storage, publisher)
 
     while True:
         changed = await storage.schedule_change_event()
@@ -320,7 +309,7 @@ async def run_scheduler(
                     target,
                     event_start,
                 )
-                _ = await _finish_opening(api, config, storage, publisher)
+                _ = await _finish_opening(storage, publisher)
             else:
                 _LOGGER.warning("Weekly announcement skipped: another event is active")
         elif action == "close":

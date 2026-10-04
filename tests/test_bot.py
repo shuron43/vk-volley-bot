@@ -15,6 +15,7 @@ from src.bot import (
     parse_event_start,
     setup_handlers,
 )
+from src.cards import CardPublisher
 from src.config import Config
 from src.formatting import format_entries, format_registration_card
 from src.keyboard import build_inline_keyboard
@@ -72,7 +73,6 @@ def test_help_text_when_requested() -> None:
     assert "- Имя" in text
     assert "список — показать актуальную карточку в конце чата" in text
     assert "помощь" in text
-    assert help_text(compact=True) == text
 
 
 def test_registration_card_contains_event_details_and_participants() -> None:
@@ -179,7 +179,7 @@ async def test_message_handlers_ignore_events_from_other_peers() -> None:
     api = MagicMock()
     api.users.get = AsyncMock(return_value=[])
     bot.api = api
-    setup_handlers(bot, storage, config)
+    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
     message = MagicMock(spec=Message)
     message.peer_id = peer_id + 1
     message.from_id = 123
@@ -209,7 +209,7 @@ async def test_callback_handlers_ignore_events_from_other_peers() -> None:
     api = MagicMock()
     api.users.get = AsyncMock(return_value=[])
     bot.api = api
-    setup_handlers(bot, storage, config)
+    setup_handlers(bot, storage, config, CardPublisher(api, config, storage))
     event = MagicMock(spec=MessageEvent)
     event.peer_id = peer_id + 1
     event.user_id = 123
