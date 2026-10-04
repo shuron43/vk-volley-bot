@@ -1,5 +1,8 @@
 # Деплой
 
+Для Ubuntu 24.04 в LXC-контейнере на Proxmox есть отдельная [пошаговая инструкция](PROXMOX_LXC.md)
+с готовым [unit systemd](../deploy/vk-bot.service).
+
 ## Требования к серверу
 
 - Python 3.12+

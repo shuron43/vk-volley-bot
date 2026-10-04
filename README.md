@@ -296,6 +296,7 @@ ADMIN_VK_IDS_RAW=123456789,987654321
 | [`docs/BOT_COMMANDS.md`](docs/BOT_COMMANDS.md) | Полный список команд с примерами диалогов |
 | [`docs/TESTING.md`](docs/TESTING.md) | Как проверить работоспособность бота |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, systemd, VPS, облачные платформы |
+| [`docs/PROXMOX_LXC.md`](docs/PROXMOX_LXC.md) | Ubuntu 24.04 в LXC на Proxmox: установка, пояснения, systemd и резервирование |
 | [`docs/CLOUDRU.md`](docs/CLOUDRU.md) | Деплой на **cloud.ru** через ВМ |
 | [`docs/CLOUDRU_CONTAINERAPPS.md`](docs/CLOUDRU_CONTAINERAPPS.md) | Деплой на **cloud.ru Container Apps** |
 
